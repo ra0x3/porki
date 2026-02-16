@@ -27,7 +27,9 @@ LOGGER = logging.getLogger(__name__)
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
-    parser = argparse.ArgumentParser(prog="porki", description="Porki agent/orchestrator entrypoint")
+    parser = argparse.ArgumentParser(
+        prog="porki", description="Porki agent/orchestrator entrypoint"
+    )
     parser.add_argument(
         "--role", required=True, choices=["agent", "orchestrator"], help="Process role"
     )

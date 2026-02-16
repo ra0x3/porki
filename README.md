@@ -5,12 +5,32 @@ Agentic orchestration.
 `porki` is an orchestration runtime designed to run with
 [systemg](https://github.com/ra0x3/systemg).
 
-## Requirements
+## Dependencies
 
-- Python 3.10+
-- `systemg` available on your machine (`sysg` CLI), since `porki` uses it for supervised process spawning.
+- `python` 3.10+
+- `systemg` (`sysg` CLI available on PATH)
+- `redis` (server reachable by `--redis-url`)
+- an LLM CLI: `claude` or `codex`
 
-## Install
+## Workspace Setup (uv)
+
+```bash
+uv sync
+```
+
+## Run
+
+```bash
+uv run porki --help
+```
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+## Package Install
 
 ```bash
 pip install porki

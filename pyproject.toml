@@ -25,10 +25,22 @@ py-modules = ["main"]
 [tool.setuptools.packages.find]
 include = ["porki"]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.13",
+    "build>=1.4.0",
+    "twine>=6.2.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 filterwarnings = [
-  "error::DeprecationWarning"
+  "error::DeprecationWarning",
+  "ignore:Call to '__init__' function with deprecated usage of input argument/s '.*':DeprecationWarning",
 ]
 
 [tool.ruff]

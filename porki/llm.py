@@ -565,7 +565,11 @@ class ClaudeCLIClient(LLMClient):
         if period_normalized == "pm":
             hour_24 += 12
 
-        local_now = (now or datetime.now().astimezone()).astimezone()
+        # Preserve caller-provided timezone in tests; otherwise use local timezone.
+        if now is not None:
+            local_now = now
+        else:
+            local_now = datetime.now().astimezone()
         reset_at = local_now.replace(hour=hour_24, minute=minute, second=0, microsecond=0)
         if reset_at <= local_now:
             reset_at += timedelta(days=1)
