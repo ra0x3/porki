@@ -1,46 +1,126 @@
 # porki
 
-Agentic orchestration.
+<img src="https://i.imgur.com/VQ0Uk3g.png" width="250" height="250" />
 
-`porki` is an orchestration runtime designed to run with
-[systemg](https://github.com/ra0x3/systemg).
+<div display="flex" align-items="center">
+    <img src="https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white" />
+    <img src="https://img.shields.io/badge/Claude-D97757?style=for-the-badge&logo=anthropic&logoColor=white" />
+    <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" />
+    <img src="https://img.shields.io/badge/mac%20os-000000?style=for-the-badge&logo=apple&logoColor=white" />
+    <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" />
+</div>
 
-## Dependencies
+## Table of Contents
+
+1. [Description](#description)
+2. [Quickstart](#quickstart)
+   - 2.1 [Install](#install)
+   - 2.2 [Simple Command](#simple-command)
+3. [Installation](#installation)
+   - 3.1 [Prerequisites](#prerequisites)
+   - 3.2 [PyPI](#pypi)
+   - 3.3 [From Source](#from-source)
+   - 3.4 [Development Only (uv)](#development-only-uv)
+4. [Test](#test)
+5. [CLI Reference](#cli-reference)
+
+---
+
+## Description
+
+`porki` is an agentic orchestration runtime for multi-agent workflows. It coordinates orchestrator and agent processes, persists shared state in Redis, and uses an LLM CLI (`claude` or `codex`) to plan and execute tasks.
+
+It leverages markdown-based control files: a primary `INSTRUCTIONS.md` for orchestrator/agent directives and per-agent heartbeat markdown files for live control signals (for example pause/resume-style runtime directives).
+
+Example usage: [Systemg Orchestrator](https://github.com/ra0x3/systemg/tree/main/examples/orchestrator)
+
+> [!WARNING]
+> Designed to run with [systemg](https://github.com/ra0x3/systemg).
+
+## Quickstart
+
+### Install
+
+```bash
+pip install porki
+```
+
+### Simple Command
+
+```bash
+porki --help
+```
+
+Minimal runtime example (orchestrator + agent) with bundled test assets:
+
+```bash
+porki \
+  --role orchestrator \
+  --instructions tests/assets/INSTRUCTIONS.md \
+  --llm-provider codex \
+  --llm-cli codex
+```
+
+```bash
+porki \
+  --role agent \
+  --instructions tests/assets/instructions/agent-research.md \
+  --heartbeat tests/assets/instructions/heartbeat/agent-research.md \
+  --agent-name agent-research \
+  --goal-id goal-demo \
+  --llm-provider codex \
+  --llm-cli codex
+```
+
+By default, `--redis-url` is `fakeredis://` for local/demo usage.
+
+## Installation
+
+### Prerequisites
 
 - `python` 3.10+
 - `systemg` (`sysg` CLI available on PATH)
 - `redis` (server reachable by `--redis-url`)
 - an LLM CLI: `claude` or `codex`
 
-## Workspace Setup (uv)
-
-```bash
-uv sync
-```
-
-## Run
-
-```bash
-uv run porki --help
-```
-
-## Tests
-
-```bash
-uv run pytest
-```
-
-## Package Install
+### PyPI
 
 ```bash
 pip install porki
 ```
 
-## CLI
+### From Source
 
 ```bash
-porki --help
+git clone https://github.com/ra0x3/porki.git
+cd porki
+pip install -e .
 ```
+
+### Development Only (uv)
+
+`uv` commands are for development workflows (not required for normal runtime use):
+
+```bash
+uv sync
+```
+
+## Test
+
+From repository checkout:
+
+```bash
+uv run pytest
+```
+
+Without `uv`:
+
+```bash
+python -m pip install pytest
+python -m pytest
+```
+
+## CLI Reference
 
 ```text
 usage: porki [-h] --role {agent,orchestrator} --instructions INSTRUCTIONS
