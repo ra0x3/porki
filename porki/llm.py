@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,6 +23,11 @@ try:
     import tiktoken
 except ImportError:
     tiktoken = None
+
+try:
+    import redis
+except ImportError:
+    redis = None
 
 
 @dataclass
@@ -168,11 +174,18 @@ class LLMClient:
         """Install optional callback for provider spending-cap backoff events."""
         return None
 
+    def set_progress_callback(self, callback: Callable[[], None] | None) -> None:
+        """Install callback invoked periodically while waiting on provider responses."""
+        return None
+
 
 class ClaudeCLIClient(LLMClient):
     """Interact with the Claude CLI via subprocess calls."""
 
     PROGRESS_LOG_INTERVAL_SECONDS = 30
+    KEEPALIVE_INTERVAL_SECONDS = 5
+    GLOBAL_CONCURRENCY_LIMIT_ENV = "PORKI_LLM_MAX_CONCURRENCY"
+    GLOBAL_CONCURRENCY_WAIT_SECONDS_ENV = "PORKI_LLM_CONCURRENCY_WAIT_SECONDS"
     _SPENDING_CAP_PATTERN = re.compile(r"spending cap reached", re.IGNORECASE)
     _AUTO_BYPASS_ARGS = {
         "claude": "--dangerously-skip-permissions",
@@ -190,16 +203,43 @@ class ClaudeCLIClient(LLMClient):
         extra_args: list[str] | None = None,
         use_sysg_spawn: bool = False,
         on_spending_cap: Callable[[float], None] | None = None,
+        on_progress: Callable[[], None] | None = None,
+        redis_url: str | None = None,
+        max_concurrency: int | None = None,
+        concurrency_wait_seconds: float | None = None,
     ) -> None:
         """Configure Claude CLI invocation parameters."""
         self.executable = executable
         self.extra_args = extra_args or []
         self.use_sysg_spawn = use_sysg_spawn
         self._on_spending_cap = on_spending_cap
+        self._on_progress = on_progress
+        self._provider_slug = os.path.basename(self.executable).strip().lower() or "llm"
+        if max_concurrency is None:
+            raw_limit = os.getenv(self.GLOBAL_CONCURRENCY_LIMIT_ENV, "2").strip()
+            try:
+                max_concurrency = max(0, int(raw_limit))
+            except ValueError:
+                max_concurrency = 0
+        self._max_concurrency = max_concurrency
+        if concurrency_wait_seconds is None:
+            raw_wait = os.getenv(self.GLOBAL_CONCURRENCY_WAIT_SECONDS_ENV, "120").strip()
+            try:
+                concurrency_wait_seconds = max(5.0, float(raw_wait))
+            except ValueError:
+                concurrency_wait_seconds = 120.0
+        self._concurrency_wait_seconds = concurrency_wait_seconds
+        self._redis = None
+        if redis_url and redis is not None and self._max_concurrency > 0:
+            self._redis = redis.Redis.from_url(redis_url)
 
     def set_spending_cap_callback(self, callback: Callable[[float], None] | None) -> None:
         """Install callback invoked before sleeping on spending-cap errors."""
         self._on_spending_cap = callback
+
+    def set_progress_callback(self, callback: Callable[[], None] | None) -> None:
+        """Install callback invoked while waiting for long-running provider calls."""
+        self._on_progress = callback
 
     def create_goal_dag(self, instructions: str, *, goal_id: str) -> DagModel:
         """Request a DAG from Claude and validate it."""
@@ -455,37 +495,49 @@ class ClaudeCLIClient(LLMClient):
         logger.debug("Executing command: %s", " ".join(cmd))
 
         while True:
+            lease = self._acquire_global_concurrency_lease(timeout=timeout, operation=operation)
             started = time.monotonic()
             deadline = started + timeout
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
             next_progress = started + self.PROGRESS_LOG_INTERVAL_SECONDS
+            next_keepalive = started + self.KEEPALIVE_INTERVAL_SECONDS
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
 
-            while process.poll() is None:
-                now = time.monotonic()
-                if now >= deadline:
-                    process.kill()
-                    process.communicate()
-                    raise RuntimeError(
-                        "Claude CLI timed out after "
-                        f"{timeout}s for {operation} Prompt({prompt_meta.id})"
-                    )
-                if now >= next_progress:
-                    remaining = int(max(0, deadline - now))
-                    logger.info(
-                        "Waiting for LLM response for Prompt(%s): %ds left",
-                        prompt_meta.id,
-                        remaining,
-                    )
-                    next_progress = now + self.PROGRESS_LOG_INTERVAL_SECONDS
-                time.sleep(0.5)
+                while process.poll() is None:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        process.kill()
+                        process.communicate()
+                        raise RuntimeError(
+                            "Claude CLI timed out after "
+                            f"{timeout}s for {operation} Prompt({prompt_meta.id})"
+                        )
+                    if now >= next_progress:
+                        remaining = int(max(0, deadline - now))
+                        logger.info(
+                            "Waiting for LLM response for Prompt(%s): %ds left",
+                            prompt_meta.id,
+                            remaining,
+                        )
+                        next_progress = now + self.PROGRESS_LOG_INTERVAL_SECONDS
+                    if now >= next_keepalive:
+                        if self._on_progress is not None:
+                            self._on_progress()
+                        self._renew_global_concurrency_lease(
+                            lease, ttl_seconds=max(timeout + 120, 120)
+                        )
+                        next_keepalive = now + self.KEEPALIVE_INTERVAL_SECONDS
+                    time.sleep(0.5)
 
-            stdout, stderr = process.communicate()
+                stdout, stderr = process.communicate()
+            finally:
+                self._release_global_concurrency_lease(lease)
             finished = time.monotonic()
             elapsed_ms = int((finished - started) * 1000)
             response_text = stdout.strip()
@@ -582,7 +634,7 @@ class ClaudeCLIClient(LLMClient):
         required_keys: set[str],
         operation: str,
         invoke_timeout: int = PROMPT_TIMEOUT_SECONDS,
-        max_attempts: int = 3,
+        max_attempts: int = 2,
     ) -> dict:
         """Invoke Claude and enforce strict JSON response shape with retries."""
         current_prompt = prompt
@@ -607,7 +659,6 @@ class ClaudeCLIClient(LLMClient):
                 if attempt >= max_attempts:
                     break
                 current_prompt = self._build_repair_prompt(
-                    original_prompt=prompt,
                     bad_output=raw,
                     required_keys=required_keys,
                 )
@@ -616,22 +667,74 @@ class ClaudeCLIClient(LLMClient):
     @staticmethod
     def _build_repair_prompt(
         *,
-        original_prompt: str,
         bad_output: str,
         required_keys: set[str],
     ) -> str:
         """Build corrective prompt for invalid JSON output retries."""
         ordered_keys = sorted(required_keys)
+        clipped_output = bad_output[:1200]
         return (
             "Your previous response violated the JSON contract.\n"
             f"Required keys (exactly): {ordered_keys}\n"
             "Return exactly one JSON object. No prose, no markdown, no code fences.\n"
             "If a value is unknown, use null or an empty string/list as appropriate.\n\n"
-            "Original prompt:\n"
-            f"{original_prompt}\n\n"
             "Previous invalid output:\n"
-            f"{bad_output}"
+            f"{clipped_output}"
         )
+
+    def _acquire_global_concurrency_lease(
+        self,
+        *,
+        timeout: int,
+        operation: str,
+    ) -> tuple[str, str] | None:
+        """Claim one global LLM slot from Redis when configured."""
+        if self._redis is None or self._max_concurrency <= 0:
+            return None
+        deadline = time.monotonic() + min(float(timeout), self._concurrency_wait_seconds)
+        token = f"{os.getpid()}:{uuid.uuid4().hex}"
+        ttl_seconds = max(timeout + 120, 120)
+        prefix = f"llm:{self._provider_slug}:slot:"
+        while time.monotonic() < deadline:
+            for slot in range(self._max_concurrency):
+                key = f"{prefix}{slot}"
+                if self._redis.set(key, token, nx=True, px=int(ttl_seconds * 1000)):
+                    return key, token
+            time.sleep(0.25)
+        raise RuntimeError(
+            f"Timed out waiting for global LLM concurrency slot for {operation} "
+            f"(limit={self._max_concurrency})"
+        )
+
+    def _renew_global_concurrency_lease(
+        self,
+        lease: tuple[str, str] | None,
+        *,
+        ttl_seconds: int,
+    ) -> None:
+        """Extend active global slot lease while command remains in-flight."""
+        if self._redis is None or lease is None:
+            return
+        key, token = lease
+        value = self._redis.get(key)
+        if value is None:
+            return
+        owner = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        if owner != token:
+            return
+        self._redis.pexpire(key, int(ttl_seconds * 1000))
+
+    def _release_global_concurrency_lease(self, lease: tuple[str, str] | None) -> None:
+        """Release a previously-acquired global LLM slot lease."""
+        if self._redis is None or lease is None:
+            return
+        key, token = lease
+        value = self._redis.get(key)
+        if value is None:
+            return
+        owner = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        if owner == token:
+            self._redis.delete(key)
 
     @staticmethod
     def _validate_payload_keys(payload: dict, *, required_keys: set[str]) -> None:
@@ -771,6 +874,10 @@ class CodexCLIClient(ClaudeCLIClient):
         extra_args: list[str] | None = None,
         use_sysg_spawn: bool = False,
         on_spending_cap: Callable[[float], None] | None = None,
+        on_progress: Callable[[], None] | None = None,
+        redis_url: str | None = None,
+        max_concurrency: int | None = None,
+        concurrency_wait_seconds: float | None = None,
     ) -> None:
         """Configure Codex CLI invocation parameters."""
         super().__init__(
@@ -778,6 +885,10 @@ class CodexCLIClient(ClaudeCLIClient):
             extra_args=extra_args,
             use_sysg_spawn=use_sysg_spawn,
             on_spending_cap=on_spending_cap,
+            on_progress=on_progress,
+            redis_url=redis_url,
+            max_concurrency=max_concurrency,
+            concurrency_wait_seconds=concurrency_wait_seconds,
         )
 
 
@@ -785,6 +896,10 @@ def create_llm_client(
     config: LLMRuntimeConfig,
     *,
     on_spending_cap: Callable[[float], None] | None = None,
+    on_progress: Callable[[], None] | None = None,
+    redis_url: str | None = None,
+    max_concurrency: int | None = None,
+    concurrency_wait_seconds: float | None = None,
 ) -> LLMClient:
     """Construct a provider-specific LLM client from runtime config."""
     provider = config.provider.strip().lower()
@@ -794,6 +909,10 @@ def create_llm_client(
             extra_args=list(config.extra_args),
             use_sysg_spawn=config.use_sysg_spawn,
             on_spending_cap=on_spending_cap,
+            on_progress=on_progress,
+            redis_url=redis_url,
+            max_concurrency=max_concurrency,
+            concurrency_wait_seconds=concurrency_wait_seconds,
         )
     if provider == "codex":
         return CodexCLIClient(
@@ -801,5 +920,9 @@ def create_llm_client(
             extra_args=list(config.extra_args),
             use_sysg_spawn=config.use_sysg_spawn,
             on_spending_cap=on_spending_cap,
+            on_progress=on_progress,
+            redis_url=redis_url,
+            max_concurrency=max_concurrency,
+            concurrency_wait_seconds=concurrency_wait_seconds,
         )
     raise ValueError(f"Unsupported LLM provider: {config.provider}")

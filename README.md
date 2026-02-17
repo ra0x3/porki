@@ -1,6 +1,6 @@
 # porki
 
-<img src="https://i.imgur.com/VQ0Uk3g.png" width="250" height="250" />
+<img src="https://i.imgur.com/A9d5wWF.png" width="300" height="300" />
 
 <div display="flex" align-items="center">
     <img src="https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white" />

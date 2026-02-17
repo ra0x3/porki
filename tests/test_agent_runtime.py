@@ -550,3 +550,100 @@ def test_goal_spending_cap_backoff_skips_work_cycle(redis_store, tmp_path):
     state = redis_store.get_task_state("task-1")
     assert state is not None
     assert state.status is TaskStatus.READY
+
+
+def test_duplicate_agent_runtime_is_rejected(redis_store, tmp_path):
+    """Second runtime with same agent name should refuse startup."""
+    goal_id = "goal-duplicate-agent"
+    redis_store.write_dag(_prepare_dag(goal_id))
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    first = AgentRuntime(
+        agent_name="agent-research",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    second = AgentRuntime(
+        agent_name="agent-research",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+
+    assert redis_store.acquire_agent_active_slot(
+        "agent-research", pid=first._pid, ttl=timedelta(seconds=30)
+    )
+    second.run(max_cycles=1)
+    state = redis_store.get_task_state("task-1")
+    assert state is not None
+    assert state.status is TaskStatus.READY
+    redis_store.release_agent_active_slot("agent-research", pid=first._pid)
+
+
+def test_recovery_failure_requeues_at_root_without_nested_ids(redis_store, tmp_path):
+    """Recovery retries should target the root task instead of nested recovery chains."""
+    goal_id = "goal-recovery-root"
+    root = TaskNode(
+        id="task-1",
+        title="Root task",
+        priority=1,
+        metadata={"recovery_attempts": "1", "required_role": "features-dev"},
+    )
+    recovery = TaskNode(
+        id="task-1__recover_1",
+        title="Recover root",
+        priority=2,
+        metadata={
+            "phase": "development",
+            "required_role": "features-dev",
+            "parent_task_id": "task-1",
+            "recovery_for": "task-1",
+            "recovery_attempt": "1",
+            "recovery_attempts": "1",
+        },
+    )
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[root, recovery],
+        edges=[TaskEdge(source=recovery.id, target=root.id)],
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state(
+        recovery.id, TaskState(status=TaskStatus.RUNNING, owner="features-dev")
+    )
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="features-dev",
+        agent_role="features-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+
+    agent._record_failure_or_recovery(recovery, "timeout talking to provider")
+    dag_after = redis_store.read_dag(goal_id)
+    assert dag_after is not None
+    ids = {node.id for node in dag_after.nodes}
+    assert "task-1__recover_2" in ids
+    assert not any("__recover_1__recover_" in node_id for node_id in ids)
+    root_after = redis_store.get_task_node(goal_id, "task-1")
+    assert root_after is not None
+    assert root_after.metadata["recovery_attempts"] == "2"

@@ -153,7 +153,7 @@ def run_cli(argv: list[str] | None = None) -> int:
     if args.role == "agent":
         if not args.agent_name or not args.goal_id or not args.heartbeat:
             parser.error("Agent role requires --agent-name, --goal-id, and --heartbeat")
-        llm_client = create_llm_client(llm_config)
+        llm_client = create_llm_client(llm_config, redis_url=args.redis_url)
         runtime = AgentRuntime(
             agent_name=args.agent_name,
             agent_role=args.agent_role or args.agent_name,
@@ -170,7 +170,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         runtime.run()
         return 0
 
-    llm_client = create_llm_client(llm_config)
+    llm_client = create_llm_client(llm_config, redis_url=args.redis_url)
     orchestrator = Orchestrator(
         instructions_path=args.instructions,
         redis_store=store,
