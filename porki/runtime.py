@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import uuid
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ class AgentRuntime(BaseLogger):
     """Coordinates local memory, heartbeat control, and Redis state."""
 
     MAX_RECOVERY_ATTEMPTS = 3
+    MAX_SAME_SIGNATURE_RECOVERY_ATTEMPTS = 2
     MIN_RECOVERY_CONFIDENCE = 0.75
     _RECOVERABLE_ERROR_PATTERNS = (
         re.compile(r"spending cap reached", re.IGNORECASE),
@@ -75,9 +77,11 @@ class AgentRuntime(BaseLogger):
         self._in_spending_cap_backoff = False
         self._last_reload = datetime.fromtimestamp(0, tz=timezone.utc)
         self._last_heartbeat_poll = datetime.fromtimestamp(0, tz=timezone.utc)
+        self._pid = os.getpid()
 
         self._hydrate_memory()
         self.llm_client.set_spending_cap_callback(self._on_spending_cap)
+        self.llm_client.set_progress_callback(self._make_progress_callback())
 
     def _hydrate_memory(self) -> None:
         """Restore memory snapshot from Redis if present."""
@@ -169,6 +173,7 @@ class AgentRuntime(BaseLogger):
     def heartbeat(self) -> None:
         """Publish agent heartbeat to Redis."""
         self.redis_store.heartbeat_agent(self.agent_name, ttl=self.lease_ttl)
+        self.redis_store.renew_agent_active_slot(self.agent_name, self._pid, self.lease_ttl)
 
     def _on_spending_cap(self, wait_seconds: float) -> None:
         """Publish goal-wide spending-cap backoff window."""
@@ -184,10 +189,16 @@ class AgentRuntime(BaseLogger):
 
     def run(self, *, max_cycles: int | None = None) -> None:
         """Run agent loop until stopped or cycle limit reached."""
-        pid = os.getpid()
+        pid = self._pid
         self.logger.info(
             "[%s] Starting agent (PID=%d) for goal %s", self.agent_name, pid, self.goal_id
         )
+        if not self.redis_store.acquire_agent_active_slot(self.agent_name, pid, self.lease_ttl):
+            self.logger.error(
+                "[%s] Active runtime already exists; refusing duplicate agent start",
+                self.agent_name,
+            )
+            return
         self.redis_store.register_agent(
             self.agent_name, pid, capabilities={"role": self.agent_role}
         )
@@ -246,6 +257,7 @@ class AgentRuntime(BaseLogger):
         )
         self.redis_store.store_memory_snapshot(self.agent_name, memory_snapshot)
         self.redis_store.deregister_agent(self.agent_name)
+        self.redis_store.release_agent_active_slot(self.agent_name, pid)
         self.logger.info("[%s] Agent shutdown complete", self.agent_name)
 
     def stop(self) -> None:
@@ -287,6 +299,7 @@ class AgentRuntime(BaseLogger):
         self.logger.info(
             "[%s] Asking LLM to select from %d tasks", self.agent_name, len(ready_nodes)
         )
+        self.llm_client.set_progress_callback(self._make_progress_callback())
         selection = self.llm_client.select_next_task(
             ready_nodes,
             memory=self.memory,
@@ -329,10 +342,23 @@ class AgentRuntime(BaseLogger):
             self.logger.info(
                 "[%s] Acquired lock for task %s: %s", self.agent_name, node.id, node.title
             )
+            guard_token = f"{self.agent_name}:{uuid.uuid4().hex}"
+            if not self.redis_store.acquire_execution_guard(
+                node.id, guard_token, self._execution_guard_ttl()
+            ):
+                self.logger.warning(
+                    "[%s] Execution guard already active for %s; skipping duplicate run",
+                    self.agent_name,
+                    node.id,
+                )
+                return
             state = self.redis_store.get_task_state(node.id) or TaskState(status=TaskStatus.READY)
             lease_expires = datetime.now(timezone.utc) + self.lease_ttl
             state = state.as_running(owner=self.agent_name, lease_expires=lease_expires)
             self.redis_store.update_task_state(node.id, state)
+            self.llm_client.set_progress_callback(
+                self._make_progress_callback(task_id=node.id, guard_token=guard_token)
+            )
 
             self.logger.info("[%s] Executing task %s with LLM", self.agent_name, node.id)
             execution = self.llm_client.execute_task(
@@ -373,6 +399,8 @@ class AgentRuntime(BaseLogger):
             self.logger.exception("Full exception details:")
             self._record_failure_or_recovery(node, str(exc))
         finally:
+            self.llm_client.set_progress_callback(self._make_progress_callback())
+            self.redis_store.release_execution_guard(node.id, guard_token)
             self.logger.info("[%s] Releasing lock for task %s", self.agent_name, node.id)
             self.redis_store.release_lock(node.id, self.agent_name)
 
@@ -411,57 +439,96 @@ class AgentRuntime(BaseLogger):
 
     def _record_failure_or_recovery(self, node: TaskNode, error: str) -> None:
         """Create remediation task for recoverable errors; otherwise fail."""
-        attempts = int(node.metadata.get("recovery_attempts", "0"))
+        root_node = self._resolve_recovery_root(node)
+        attempts = max(
+            int(root_node.metadata.get("recovery_attempts", "0")),
+            int(root_node.metadata.get("recovery_attempt", "0")),
+        )
+        signature = self._error_signature(error)
+        previous_signature = root_node.metadata.get("last_recovery_signature", "")
+        same_signature_attempts = (
+            int(root_node.metadata.get("same_recovery_signature_attempts", "0"))
+            if signature == previous_signature
+            else 0
+        )
+        same_signature_attempts += 1
+        if same_signature_attempts > self.MAX_SAME_SIGNATURE_RECOVERY_ATTEMPTS:
+            self.logger.error(
+                "[%s] Recovery halted for %s due to repeated signature (%s)",
+                self.agent_name,
+                root_node.id,
+                signature,
+            )
+            self._record_failure(root_node, error)
+            if node.id != root_node.id:
+                self._record_failure(node, error)
+            return
         if attempts >= self.MAX_RECOVERY_ATTEMPTS:
             self.logger.error(
                 "[%s] Recovery exhausted for task %s after %d attempts",
                 self.agent_name,
-                node.id,
+                root_node.id,
                 attempts,
             )
-            self._record_failure(node, error)
+            self._record_failure(root_node, error)
+            if node.id != root_node.id:
+                self._record_failure(node, error)
             return
 
         decision = self._build_recovery_decision(node, error)
         if not decision.recoverable:
-            self._record_failure(node, error)
+            self._record_failure(root_node, error)
+            if node.id != root_node.id:
+                self._record_failure(node, error)
             return
 
         attempt = attempts + 1
-        node.metadata["recovery_attempts"] = str(attempt)
+        root_node.metadata["recovery_attempts"] = str(attempt)
+        root_node.metadata["last_recovery_signature"] = signature
+        root_node.metadata["same_recovery_signature_attempts"] = str(same_signature_attempts)
         if decision.reason:
-            node.metadata["last_recovery_reason"] = decision.reason[:300]
-        self.redis_store.update_task_node(self.goal_id, node)
+            root_node.metadata["last_recovery_reason"] = decision.reason[:300]
+        self.redis_store.update_task_node(self.goal_id, root_node)
 
         remediation_title = decision.remediation_title.strip()
         if not remediation_title:
-            remediation_title = f"Recover blocked task {node.id}"
+            remediation_title = f"Recover blocked task {root_node.id}"
         recovery_id = self.redis_store.create_recovery_task(
             goal_id=self.goal_id,
-            blocked_task_id=node.id,
-            owner_role=node.metadata.get("required_role", self.agent_role),
+            blocked_task_id=root_node.id,
+            recovery_root_id=root_node.id,
+            owner_role=root_node.metadata.get("required_role", self.agent_role),
             recovery_attempt=attempt,
-            priority=max(0, node.priority + 2),
+            priority=max(0, root_node.priority + 2),
             title=remediation_title,
         )
         progress = (
-            f"Recoverable failure on {node.id}; created remediation task {recovery_id} "
+            f"Recoverable failure on {root_node.id}; created remediation task {recovery_id} "
             f"(attempt {attempt}/{self.MAX_RECOVERY_ATTEMPTS})."
         )
         self.redis_store.update_task_state(
-            node.id,
+            root_node.id,
             TaskState(
                 status=TaskStatus.BLOCKED,
                 progress=progress,
                 last_error=error[:600],
             ),
         )
+        if node.id != root_node.id:
+            self.redis_store.update_task_state(
+                node.id,
+                TaskState(
+                    status=TaskStatus.FAILED,
+                    progress=f"Superseded by {recovery_id}",
+                    last_error=error[:600],
+                ),
+            )
         self.memory.append(progress)
         self.redis_store.store_memory_snapshot(self.agent_name, self.memory.snapshot())
         self.logger.warning(
             "[%s] Recoverable failure for %s. remediation=%s attempt=%d/%d reason=%s",
             self.agent_name,
-            node.id,
+            root_node.id,
             recovery_id,
             attempt,
             self.MAX_RECOVERY_ATTEMPTS,
@@ -559,6 +626,55 @@ class AgentRuntime(BaseLogger):
         )
         self.memory.append(f"QA failed {node.id}: cycle {cycle}")
         self.redis_store.store_memory_snapshot(self.agent_name, self.memory.snapshot())
+
+    def _execution_guard_ttl(self) -> timedelta:
+        """Return TTL for per-task in-flight execution guards."""
+        return timedelta(seconds=max(300, int(self.lease_ttl.total_seconds() * 4)))
+
+    def _make_progress_callback(
+        self,
+        *,
+        task_id: str | None = None,
+        guard_token: str | None = None,
+    ):
+        """Build periodic callback for long-running LLM requests."""
+
+        def _callback() -> None:
+            self.heartbeat()
+            if not task_id:
+                return
+            if self.redis_store.renew_lock(task_id, self.agent_name, self.lease_ttl):
+                state = self.redis_store.get_task_state(task_id)
+                if (
+                    state
+                    and state.status in {TaskStatus.RUNNING, TaskStatus.CLAIMED}
+                    and state.owner == self.agent_name
+                ):
+                    self.redis_store.update_task_state(
+                        task_id,
+                        state.model_copy(
+                            update={"lease_expires": datetime.now(timezone.utc) + self.lease_ttl}
+                        ),
+                    )
+            if guard_token:
+                self.redis_store.renew_execution_guard(
+                    task_id, guard_token, self._execution_guard_ttl()
+                )
+
+        return _callback
+
+    def _resolve_recovery_root(self, node: TaskNode) -> TaskNode:
+        """Resolve the canonical task node that owns recovery attempts."""
+        root_id = node.metadata.get("recovery_for") or node.id
+        root_node = self.redis_store.get_task_node(self.goal_id, root_id)
+        return root_node or node
+
+    @staticmethod
+    def _error_signature(error: str) -> str:
+        """Normalize an error into a compact signature for loop detection."""
+        normalized = re.sub(r"\s+", " ", error.lower()).strip()
+        normalized = re.sub(r"\d+", "#", normalized)
+        return normalized[:180]
 
     def _is_node_eligible(self, node: TaskNode) -> bool:
         """Return whether this agent may claim and run the node now."""

@@ -64,6 +64,11 @@ class RedisStore(BaseLogger):
         return f"agent:{agent_name}:heartbeat"
 
     @staticmethod
+    def _agent_active_key(agent_name: str) -> str:
+        """Return the Redis key guarding one active runtime per agent."""
+        return f"agent:{agent_name}:active"
+
+    @staticmethod
     def _agent_memory_key(agent_name: str) -> str:
         """Return the Redis key for agent memory snapshots."""
         return f"agent:{agent_name}:memory"
@@ -72,6 +77,11 @@ class RedisStore(BaseLogger):
     def _goal_spending_cap_key(goal_id: str) -> str:
         """Return the Redis key tracking goal-wide spending-cap backoff."""
         return f"goal:{goal_id}:spending_cap_until"
+
+    @staticmethod
+    def _execution_guard_key(task_id: str) -> str:
+        """Return the Redis key guarding one active execution per task."""
+        return f"task:{task_id}:execution_guard"
 
     def write_dag(self, dag: DagModel) -> None:
         """Persist DAG structure and initialize task states."""
@@ -174,6 +184,7 @@ class RedisStore(BaseLogger):
         *,
         goal_id: str,
         blocked_task_id: str,
+        recovery_root_id: str,
         owner_role: str,
         recovery_attempt: int,
         priority: int,
@@ -200,8 +211,9 @@ class RedisStore(BaseLogger):
                 "phase": "development",
                 "required_role": owner_role,
                 "parent_task_id": blocked_task_id,
-                "recovery_for": blocked_task_id,
+                "recovery_for": recovery_root_id,
                 "recovery_attempt": str(recovery_attempt),
+                "recovery_attempts": str(recovery_attempt),
             },
         )
         nodes_key = self._nodes_key(goal_id)
@@ -211,6 +223,9 @@ class RedisStore(BaseLogger):
 
         blocked_deps_raw = self.client.hget(deps_key, blocked_task_id)
         blocked_deps = json.loads(blocked_deps_raw) if blocked_deps_raw else []
+        blocked_deps = [
+            dep for dep in blocked_deps if not dep.startswith(f"{blocked_task_id}__recover_")
+        ]
         if recovery_id not in blocked_deps:
             blocked_deps.append(recovery_id)
             self.client.hset(deps_key, blocked_task_id, json.dumps(blocked_deps))
@@ -309,6 +324,10 @@ class RedisStore(BaseLogger):
             lease_expired = bool(state.lease_expires and state.lease_expires <= now)
             if not lock_missing and not lease_expired:
                 continue
+            if state.owner:
+                last_heartbeat = self.agent_last_heartbeat(state.owner)
+                if last_heartbeat and (now - last_heartbeat) < timedelta(seconds=45):
+                    continue
 
             recovered_state = state.model_copy(
                 update={"status": TaskStatus.READY, "owner": None, "lease_expires": None}
@@ -374,6 +393,28 @@ class RedisStore(BaseLogger):
             payload.update({f"cap:{k}": v for k, v in capabilities.items()})
         self.client.hset(self._agent_registration_key(agent_name), mapping=payload)
 
+    def acquire_agent_active_slot(self, agent_name: str, pid: int, ttl: timedelta) -> bool:
+        """Claim singleton runtime slot for an agent name."""
+        key = self._agent_active_key(agent_name)
+        return bool(self.client.set(key, str(pid), nx=True, px=int(ttl.total_seconds() * 1000)))
+
+    def renew_agent_active_slot(self, agent_name: str, pid: int, ttl: timedelta) -> bool:
+        """Renew active runtime slot when still owned by this process."""
+        key = self._agent_active_key(agent_name)
+        value = self.client.get(key)
+        owner = value.decode("utf-8") if isinstance(value, bytes) else value
+        if owner != str(pid):
+            return False
+        return bool(self.client.pexpire(key, int(ttl.total_seconds() * 1000)))
+
+    def release_agent_active_slot(self, agent_name: str, pid: int) -> None:
+        """Release singleton runtime slot if this process still owns it."""
+        key = self._agent_active_key(agent_name)
+        value = self.client.get(key)
+        owner = value.decode("utf-8") if isinstance(value, bytes) else value
+        if owner == str(pid):
+            self.client.delete(key)
+
     def heartbeat_agent(self, agent_name: str, ttl: timedelta) -> None:
         """Write and TTL-protect the latest agent heartbeat."""
         key = self._agent_heartbeat_key(agent_name)
@@ -391,6 +432,28 @@ class RedisStore(BaseLogger):
         """Remove registration and heartbeat records for an agent."""
         self.client.delete(self._agent_registration_key(agent_name))
         self.client.delete(self._agent_heartbeat_key(agent_name))
+
+    def acquire_execution_guard(self, task_id: str, token: str, ttl: timedelta) -> bool:
+        """Claim per-task execution guard to avoid duplicate in-flight task runs."""
+        key = self._execution_guard_key(task_id)
+        return bool(self.client.set(key, token, nx=True, px=int(ttl.total_seconds() * 1000)))
+
+    def renew_execution_guard(self, task_id: str, token: str, ttl: timedelta) -> bool:
+        """Renew per-task execution guard when still owned by the same token."""
+        key = self._execution_guard_key(task_id)
+        value = self.client.get(key)
+        owner = value.decode("utf-8") if isinstance(value, bytes) else value
+        if owner != token:
+            return False
+        return bool(self.client.pexpire(key, int(ttl.total_seconds() * 1000)))
+
+    def release_execution_guard(self, task_id: str, token: str) -> None:
+        """Release per-task execution guard if token matches current owner."""
+        key = self._execution_guard_key(task_id)
+        value = self.client.get(key)
+        owner = value.decode("utf-8") if isinstance(value, bytes) else value
+        if owner == token:
+            self.client.delete(key)
 
     def store_memory_snapshot(self, agent_name: str, entries: Iterable[str]) -> None:
         """Persist an agent memory snapshot."""
