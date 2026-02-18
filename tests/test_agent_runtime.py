@@ -208,6 +208,45 @@ def test_agent_pause_directive(redis_store, tmp_path, assets_dir):
     assert state.status is not TaskStatus.DEV_DONE
 
 
+def test_reload_instructions_warns_only_when_file_missing(redis_store, tmp_path, caplog):
+    """Instruction-missing warning should be emitted only for absent files."""
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="agent-research",
+        goal_id="goal-warn-on-missing",
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        agent.reload_instructions()
+
+    existing_path_warnings = [
+        rec for rec in caplog.records if "Instructions file missing" in rec.getMessage()
+    ]
+    assert not existing_path_warnings
+
+    caplog.clear()
+    missing_path = tmp_path / "missing-instructions.md"
+    agent.instructions_path = missing_path
+
+    with caplog.at_level(logging.WARNING):
+        agent.reload_instructions()
+
+    missing_path_warnings = [
+        rec for rec in caplog.records if "Instructions file missing" in rec.getMessage()
+    ]
+    assert len(missing_path_warnings) == 1
+    assert str(missing_path) in missing_path_warnings[0].getMessage()
+
+
 def test_role_restriction_blocks_wrong_agent(redis_store, tmp_path):
     """Agent should not claim task assigned to another role."""
     goal_id = "goal-role-check"
