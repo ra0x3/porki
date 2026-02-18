@@ -122,7 +122,7 @@ class AgentRuntime(BaseLogger):
                 self.logger.warning("Failed to load from store, using file directly")
         else:
             self.instructions_text = ""
-        self.logger.warning("Instructions file missing: %s", self.instructions_path)
+            self.logger.warning("Instructions file missing: %s", self.instructions_path)
         self._last_reload = datetime.now(timezone.utc)
 
     def poll_heartbeat(self) -> list[HeartbeatDirective]:
