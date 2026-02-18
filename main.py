@@ -7,6 +7,7 @@ import logging
 import shutil
 import sys
 from datetime import timedelta
+from importlib import metadata
 from pathlib import Path
 
 import redis
@@ -25,10 +26,22 @@ from porki.runtime import AgentRuntime
 LOGGER = logging.getLogger(__name__)
 
 
+def _get_version() -> str:
+    """Get the current version of porki."""
+    try:
+        return metadata.version("porki")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
+    version = _get_version()
     parser = argparse.ArgumentParser(
-        prog="porki", description="Porki agent/orchestrator entrypoint"
+        prog="porki", description=f"Porki agent/orchestrator entrypoint (version {version})"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"porki {version}", help="Show version and exit"
     )
     parser.add_argument(
         "--role", required=True, choices=["agent", "orchestrator"], help="Process role"
