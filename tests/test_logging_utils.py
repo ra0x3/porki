@@ -1,7 +1,7 @@
 import logging
 from io import StringIO
 
-from porki.logging_utils import CompactingHandler
+from porki.logging_utils import CompactingHandler, EventContextFilter, EventFormatter
 
 
 class _CaptureHandler(logging.Handler):
@@ -124,3 +124,65 @@ def test_realistic_interleaved_agents_do_not_false_merge() -> None:
     output = stream.getvalue().splitlines()
     assert len(output) == len(lines)
     assert all("+" not in line.split(": ", 1)[1] for line in output)
+
+
+def test_event_context_filter_adds_defaults() -> None:
+    record = logging.LogRecord(
+        name="x",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="hello",
+        args=(),
+        exc_info=None,
+    )
+    filt = EventContextFilter()
+    assert filt.filter(record) is True
+    assert record.evt == "GEN"
+    assert record.goal == "-"
+    assert record.role == "-"
+
+
+def test_event_formatter_emits_structured_suffix() -> None:
+    formatter = EventFormatter("%(levelname)s %(message)s")
+    record = logging.LogRecord(
+        name="x",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="line",
+        args=(),
+        exc_info=None,
+    )
+    record.evt = "TASK_DONE"
+    record.goal = "orchestrator-ui"
+    record.role = "qa-dev"
+    record.task = "task-010__qa"
+    record.state = "done"
+    record.next_retry = "-"
+    rendered = formatter.format(record)
+    assert rendered.endswith(
+        "evt=TASK_DONE goal=orchestrator-ui role=qa-dev task=task-010__qa state=done next_retry=-"
+    )
+
+
+def test_compacting_handler_preserves_event_context_on_summary() -> None:
+    stream = StringIO()
+    delegate = logging.StreamHandler(stream)
+    delegate.setFormatter(EventFormatter("%(levelname)s %(message)s"))
+    handler = CompactingHandler(delegate)
+    handler.addFilter(EventContextFilter())
+    logger = logging.getLogger("test.compacting.event")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+
+    logger.info("same", extra={"evt": "QUEUE_NO_ELIGIBLE", "goal": "g1", "role": "qa-dev"})
+    logger.info("same", extra={"evt": "QUEUE_NO_ELIGIBLE", "goal": "g1", "role": "qa-dev"})
+    handler.flush()
+
+    out = stream.getvalue().strip()
+    assert "+2 same" in out
+    assert "evt=QUEUE_NO_ELIGIBLE" in out
+    assert "goal=g1" in out

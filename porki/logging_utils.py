@@ -6,6 +6,38 @@ import logging
 from typing import Final
 
 
+class EventContextFilter(logging.Filter):
+    """Populate structured event fields so every log line is parseable."""
+
+    DEFAULTS: Final[dict[str, str]] = {
+        "evt": "GEN",
+        "goal": "-",
+        "role": "-",
+        "task": "-",
+        "state": "-",
+        "next_retry": "-",
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Ensure all structured keys exist on the record."""
+        for key, value in self.DEFAULTS.items():
+            if not hasattr(record, key):
+                setattr(record, key, value)
+        return True
+
+
+class EventFormatter(logging.Formatter):
+    """Append normalized structured event context to each formatted line."""
+
+    _ORDERED_KEYS: Final[tuple[str, ...]] = ("evt", "goal", "role", "task", "state", "next_retry")
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format base message and append key-value context suffix."""
+        base = super().format(record)
+        suffix = " ".join(f"{key}={getattr(record, key, '-')}" for key in self._ORDERED_KEYS)
+        return f"{base} | {suffix}"
+
+
 class CompactingHandler(logging.Handler):
     """Collapse consecutive duplicate log messages into one counted line."""
 
@@ -97,4 +129,8 @@ class CompactingHandler(logging.Handler):
         clone.threadName = record.threadName
         clone.processName = record.processName
         clone.process = record.process
+        standard = set(clone.__dict__.keys())
+        for key, value in record.__dict__.items():
+            if key not in standard:
+                setattr(clone, key, value)
         return clone

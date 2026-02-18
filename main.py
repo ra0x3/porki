@@ -19,7 +19,7 @@ except ImportError:
 
 from porki.cache import RedisStore
 from porki.llm import LLMRuntimeConfig, create_llm_client
-from porki.logging_utils import CompactingHandler
+from porki.logging_utils import CompactingHandler, EventContextFilter, EventFormatter
 from porki.orchestrator import Orchestrator, RealSpawnAdapter
 from porki.runtime import AgentRuntime
 
@@ -121,8 +121,10 @@ def _configure_logging(level: str) -> None:
     root.handlers.clear()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     stream = logging.StreamHandler()
-    stream.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    root.addHandler(CompactingHandler(stream))
+    stream.setFormatter(EventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler = CompactingHandler(stream)
+    handler.addFilter(EventContextFilter())
+    root.addHandler(handler)
 
 
 def _resolve_llm_config(args: argparse.Namespace) -> LLMRuntimeConfig:

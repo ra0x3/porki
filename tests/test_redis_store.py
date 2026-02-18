@@ -154,3 +154,14 @@ def test_agent_active_slot_lifecycle(redis_store):
     assert redis_store.renew_agent_active_slot("agent-x", pid=101, ttl=ttl) is True
     redis_store.release_agent_active_slot("agent-x", pid=101)
     assert redis_store.acquire_agent_active_slot("agent-x", pid=202, ttl=ttl) is True
+
+
+def test_active_roles_only_include_recent_heartbeats(redis_store):
+    """Only roles with fresh heartbeats should be considered active."""
+    redis_store.register_agent("owner-agent", pid=1, capabilities={"role": "owner"})
+    redis_store.register_agent("qa-agent", pid=2, capabilities={"role": "qa-dev"})
+    redis_store.heartbeat_agent("qa-agent", ttl=timedelta(seconds=30))
+
+    roles = redis_store.active_roles(stale_after=timedelta(seconds=5))
+    assert "qa-dev" in roles
+    assert "owner" not in roles

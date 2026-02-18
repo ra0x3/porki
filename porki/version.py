@@ -19,6 +19,22 @@ class BaseLogger:
         """Initialize logger instance with optional explicit name."""
         self.logger = logging.getLogger(name or self.__class__.__name__)
 
+    def log_event(
+        self,
+        level: int,
+        event: str,
+        message: str,
+        *args: Any,
+        **context: Any,
+    ) -> None:
+        """Emit log record with structured event metadata."""
+        extra = {"evt": event}
+        for key, value in context.items():
+            if value is None:
+                continue
+            extra[key] = str(value)
+        self.logger.log(level, message, *args, extra=extra)
+
 
 @dataclass
 class InstructionVersion:

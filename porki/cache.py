@@ -307,6 +307,19 @@ class RedisStore(BaseLogger):
         )
         return ready
 
+    def goal_status_counts(self, goal_id: str) -> dict[TaskStatus, int]:
+        """Return task-status counts for a goal."""
+        dag = self.read_dag(goal_id)
+        if not dag:
+            return {}
+        counts: dict[TaskStatus, int] = {}
+        for node in dag.nodes:
+            state = self.get_task_state(node.id)
+            if not state:
+                continue
+            counts[state.status] = counts.get(state.status, 0) + 1
+        return counts
+
     def recover_stale_tasks(self, goal_id: str) -> list[str]:
         """Reset stale running/claimed tasks whose lock or lease has expired."""
         dag = self.read_dag(goal_id)
@@ -438,6 +451,30 @@ class RedisStore(BaseLogger):
             return None
         timestamp = value.decode("utf-8") if isinstance(value, bytes) else str(value)
         return datetime.fromisoformat(timestamp)
+
+    def active_roles(self, *, stale_after: timedelta | None = None) -> set[str]:
+        """Return roles with at least one recently heartbeating registered agent."""
+        grace = stale_after or self.STALE_HEARTBEAT_GRACE
+        now = _now_utc()
+        roles: set[str] = set()
+        for key in self.client.scan_iter(match="agent:*:registered"):
+            key_str = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            parts = key_str.split(":")
+            if len(parts) < 3:
+                continue
+            agent_name = parts[1]
+            role_raw = self.client.hget(key_str, "cap:role")
+            role = (
+                role_raw.decode("utf-8")
+                if isinstance(role_raw, bytes)
+                else str(role_raw)
+                if role_raw is not None
+                else agent_name
+            )
+            heartbeat = self.agent_last_heartbeat(agent_name)
+            if heartbeat and (now - heartbeat) < grace:
+                roles.add(role)
+        return roles
 
     def deregister_agent(self, agent_name: str) -> None:
         """Remove registration and heartbeat records for an agent."""

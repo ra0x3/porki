@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
 from porki.llm import (
@@ -647,3 +648,118 @@ def test_recovery_failure_requeues_at_root_without_nested_ids(redis_store, tmp_p
     root_after = redis_store.get_task_node(goal_id, "task-1")
     assert root_after is not None
     assert root_after.metadata["recovery_attempts"] == "2"
+
+
+def test_goal_completion_logs_once_when_no_work_left(redis_store, tmp_path, caplog):
+    """Runtime should emit a concise completion summary once per unchanged state."""
+    goal_id = "goal-complete-log"
+    redis_store.write_dag(_prepare_dag(goal_id))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="agent-research",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=3)
+
+    completion_logs = [
+        rec
+        for rec in caplog.records
+        if "Goal goal-complete-log complete: 0 tasks left" in rec.getMessage()
+    ]
+    assert len(completion_logs) == 1
+
+
+def test_logs_blocked_when_ready_tasks_require_inactive_roles(redis_store, tmp_path, caplog):
+    """Runtime should explain goal-wide blockage when required roles are inactive."""
+    goal_id = "goal-inactive-role"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-owner-only",
+                title="Owner work",
+                priority=1,
+                metadata={"phase": "integration", "required_role": "owner"},
+            )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="team-lead",
+        agent_role="team-lead",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.WARNING):
+        agent.run(max_cycles=1)
+
+    blocked_logs = [
+        rec for rec in caplog.records if "Goal goal-inactive-role blocked" in rec.getMessage()
+    ]
+    assert blocked_logs
+    assert "inactive roles owner" in blocked_logs[0].getMessage()
+
+
+def test_no_eligible_log_is_deduplicated_for_unchanged_queue(redis_store, tmp_path, caplog):
+    """Repeated unchanged no-eligible cycles should not spam INFO logs."""
+    goal_id = "goal-no-eligible-dedupe"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-features",
+                title="Features work",
+                priority=1,
+                metadata={"phase": "development", "required_role": "features-dev"},
+            )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="qa-dev",
+        agent_role="qa-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=3)
+
+    no_eligible_logs = [
+        rec
+        for rec in caplog.records
+        if "No eligible ready tasks for role qa-dev" in rec.getMessage()
+    ]
+    assert len(no_eligible_logs) == 1

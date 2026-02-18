@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -78,6 +79,8 @@ class AgentRuntime(BaseLogger):
         self._last_reload = datetime.fromtimestamp(0, tz=timezone.utc)
         self._last_heartbeat_poll = datetime.fromtimestamp(0, tz=timezone.utc)
         self._pid = os.getpid()
+        self._last_queue_snapshot: tuple[int, int, tuple[tuple[str, int], ...]] | None = None
+        self._last_goal_state_signature: str | None = None
 
         self._hydrate_memory()
         self.llm_client.set_spending_cap_callback(self._on_spending_cap)
@@ -119,7 +122,7 @@ class AgentRuntime(BaseLogger):
                 self.logger.warning("Failed to load from store, using file directly")
         else:
             self.instructions_text = ""
-            self.logger.warning("Instructions file missing: %s", self.instructions_path)
+        self.logger.warning("Instructions file missing: %s", self.instructions_path)
         self._last_reload = datetime.now(timezone.utc)
 
     def poll_heartbeat(self) -> list[HeartbeatDirective]:
@@ -181,22 +184,41 @@ class AgentRuntime(BaseLogger):
             return
         until = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
         self.redis_store.set_goal_spending_cap_until(self.goal_id, until)
-        self.logger.warning(
+        self.log_event(
+            logging.WARNING,
+            "BACKOFF_PUBLISH",
             "[%s] Published goal-wide spending-cap backoff until %s",
             self.agent_name,
             until.isoformat(timespec="seconds"),
+            goal=self.goal_id,
+            role=self.agent_role,
+            state="backoff",
+            next_retry=until.isoformat(timespec="seconds"),
         )
 
     def run(self, *, max_cycles: int | None = None) -> None:
         """Run agent loop until stopped or cycle limit reached."""
         pid = self._pid
-        self.logger.info(
-            "[%s] Starting agent (PID=%d) for goal %s", self.agent_name, pid, self.goal_id
+        self.log_event(
+            logging.INFO,
+            "AGENT_START",
+            "[%s] Starting agent (PID=%d) for goal %s",
+            self.agent_name,
+            pid,
+            self.goal_id,
+            goal=self.goal_id,
+            role=self.agent_role,
+            state="active",
         )
         if not self.redis_store.acquire_agent_active_slot(self.agent_name, pid, self.lease_ttl):
-            self.logger.error(
+            self.log_event(
+                logging.ERROR,
+                "AGENT_DUPLICATE",
                 "[%s] Active runtime already exists; refusing duplicate agent start",
                 self.agent_name,
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="error",
             )
             return
         self.redis_store.register_agent(
@@ -204,10 +226,15 @@ class AgentRuntime(BaseLogger):
         )
         self.reload_instructions()
         cycles = 0
-        self.logger.info(
+        self.log_event(
+            logging.INFO,
+            "AGENT_LOOP_ENTER",
             "[%s] Agent initialized, entering main loop (max_cycles=%s)",
             self.agent_name,
             max_cycles if max_cycles else "unlimited",
+            goal=self.goal_id,
+            role=self.agent_role,
+            state="active",
         )
 
         while self._active and (max_cycles is None or cycles < max_cycles):
@@ -222,18 +249,29 @@ class AgentRuntime(BaseLogger):
             in_cap_backoff = bool(cap_until and cap_until > now)
             if in_cap_backoff and not self._in_spending_cap_backoff:
                 wait_seconds = (cap_until - now).total_seconds() if cap_until else 0
-                self.logger.warning(
+                self.log_event(
+                    logging.WARNING,
+                    "BACKOFF_ACTIVE",
                     "[%s] Goal %s under spending-cap backoff for %.0fs (until %s); skipping work",
                     self.agent_name,
                     self.goal_id,
                     max(0, wait_seconds),
                     cap_until.isoformat(timespec="seconds") if cap_until else "unknown",
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    state="backoff",
+                    next_retry=cap_until.isoformat(timespec="seconds") if cap_until else "unknown",
                 )
             elif not in_cap_backoff and self._in_spending_cap_backoff:
-                self.logger.info(
+                self.log_event(
+                    logging.INFO,
+                    "BACKOFF_CLEARED",
                     "[%s] Goal %s spending-cap backoff cleared; resuming work",
                     self.agent_name,
                     self.goal_id,
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    state="active",
                 )
             self._in_spending_cap_backoff = in_cap_backoff
 
@@ -250,7 +288,16 @@ class AgentRuntime(BaseLogger):
             if self.loop_interval > 0:
                 time.sleep(self.loop_interval)
 
-        self.logger.info("[%s] Agent shutting down after %d cycles", self.agent_name, cycles)
+        self.log_event(
+            logging.INFO,
+            "AGENT_STOP",
+            "[%s] Agent shutting down after %d cycles",
+            self.agent_name,
+            cycles,
+            goal=self.goal_id,
+            role=self.agent_role,
+            state="stopped",
+        )
         memory_snapshot = self.memory.snapshot()
         self.logger.info(
             "[%s] Storing final memory snapshot (%d entries)", self.agent_name, len(memory_snapshot)
@@ -267,16 +314,25 @@ class AgentRuntime(BaseLogger):
     def _run_cycle(self) -> None:
         """Select, claim, execute, and summarize one task."""
         ready_task_ids = self.redis_store.list_ready_tasks(self.goal_id)
+        ready_role_counts = self._ready_role_counts(ready_task_ids)
         if not ready_task_ids:
-            self.logger.info("[%s] No ready tasks for goal %s", self.agent_name, self.goal_id)
+            self._emit_goal_state(ready_task_ids, ready_role_counts, eligible_count=0)
+            if self._last_queue_snapshot != (0, 0, ()):
+                self.log_event(
+                    logging.INFO,
+                    "QUEUE_EMPTY",
+                    "[%s] No ready tasks for goal %s",
+                    self.agent_name,
+                    self.goal_id,
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    state="idle",
+                )
+            else:
+                self.logger.debug("[%s] No ready tasks for goal %s", self.agent_name, self.goal_id)
+            self._last_queue_snapshot = (0, 0, ())
             return
 
-        self.logger.info(
-            "[%s] Found %d ready tasks for goal %s",
-            self.agent_name,
-            len(ready_task_ids),
-            self.goal_id,
-        )
         ready_nodes = []
         for task_id in ready_task_ids:
             node = self.redis_store.get_task_node(self.goal_id, task_id)
@@ -286,18 +342,67 @@ class AgentRuntime(BaseLogger):
                     "[%s]   Ready task: %s (priority=%d)", self.agent_name, node.id, node.priority
                 )
 
-        if not ready_nodes:
-            self.logger.info(
-                "[%s] No eligible ready tasks for role %s (global_ready=%d) on goal %s",
+        queue_snapshot = (
+            len(ready_task_ids),
+            len(ready_nodes),
+            tuple(sorted(ready_role_counts.items())),
+        )
+        snapshot_changed = self._last_queue_snapshot != queue_snapshot
+        if snapshot_changed:
+            self.log_event(
+                logging.INFO,
+                "QUEUE_SNAPSHOT",
+                "[%s] Found %d ready tasks for goal %s",
                 self.agent_name,
-                self.agent_role,
+                len(ready_task_ids),
+                self.goal_id,
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="active",
+            )
+        else:
+            self.logger.debug(
+                "[%s] Found %d ready tasks for goal %s",
+                self.agent_name,
                 len(ready_task_ids),
                 self.goal_id,
             )
+        self._last_queue_snapshot = queue_snapshot
+        self._emit_goal_state(ready_task_ids, ready_role_counts, eligible_count=len(ready_nodes))
+
+        if not ready_nodes:
+            if snapshot_changed:
+                self.log_event(
+                    logging.INFO,
+                    "QUEUE_NO_ELIGIBLE",
+                    "[%s] No eligible ready tasks for role %s (global_ready=%d) on goal %s",
+                    self.agent_name,
+                    self.agent_role,
+                    len(ready_task_ids),
+                    self.goal_id,
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    state="idle",
+                )
+            else:
+                self.logger.debug(
+                    "[%s] No eligible ready tasks for role %s (global_ready=%d) on goal %s",
+                    self.agent_name,
+                    self.agent_role,
+                    len(ready_task_ids),
+                    self.goal_id,
+                )
             return
 
-        self.logger.info(
-            "[%s] Asking LLM to select from %d tasks", self.agent_name, len(ready_nodes)
+        self.log_event(
+            logging.INFO,
+            "TASK_SELECT_REQUEST",
+            "[%s] Asking LLM to select from %d tasks",
+            self.agent_name,
+            len(ready_nodes),
+            goal=self.goal_id,
+            role=self.agent_role,
+            state="active",
         )
         self.llm_client.set_progress_callback(self._make_progress_callback())
         selection = self.llm_client.select_next_task(
@@ -307,17 +412,30 @@ class AgentRuntime(BaseLogger):
             instructions=self.instructions_text,
         )
         if not selection.selected_task_id:
-            self.logger.info(
-                "[%s] LLM declined to select a task: %s", self.agent_name, selection.justification
+            self.log_event(
+                logging.INFO,
+                "TASK_SELECT_NONE",
+                "[%s] LLM declined to select a task: %s",
+                self.agent_name,
+                selection.justification,
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="idle",
             )
             return
 
-        self.logger.info(
+        self.log_event(
+            logging.INFO,
+            "TASK_SELECTED",
             "[%s] LLM selected task %s (confidence=%.2f): %s",
             self.agent_name,
             selection.selected_task_id,
             selection.confidence,
             selection.justification,
+            goal=self.goal_id,
+            role=self.agent_role,
+            task=selection.selected_task_id,
+            state="active",
         )
 
         node = self.redis_store.get_task_node(self.goal_id, selection.selected_task_id)
@@ -332,15 +450,30 @@ class AgentRuntime(BaseLogger):
             return
 
         if not self.redis_store.acquire_lock(node.id, self.agent_name, self.lease_ttl):
-            self.logger.info(
+            self.log_event(
+                logging.INFO,
+                "TASK_LOCK_MISS",
                 "[%s] Could not acquire lock for %s (another agent has it)",
                 self.agent_name,
                 node.id,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="active",
             )
             return
         try:
-            self.logger.info(
-                "[%s] Acquired lock for task %s: %s", self.agent_name, node.id, node.title
+            self.log_event(
+                logging.INFO,
+                "TASK_LOCK_ACQUIRED",
+                "[%s] Acquired lock for task %s: %s",
+                self.agent_name,
+                node.id,
+                node.title,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="running",
             )
             guard_token = f"{self.agent_name}:{uuid.uuid4().hex}"
             if not self.redis_store.acquire_execution_guard(
@@ -360,20 +493,36 @@ class AgentRuntime(BaseLogger):
                 self._make_progress_callback(task_id=node.id, guard_token=guard_token)
             )
 
-            self.logger.info("[%s] Executing task %s with LLM", self.agent_name, node.id)
+            self.log_event(
+                logging.INFO,
+                "TASK_EXECUTE_START",
+                "[%s] Executing task %s with LLM",
+                self.agent_name,
+                node.id,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="running",
+            )
             execution = self.llm_client.execute_task(
                 node,
                 goal_id=self.goal_id,
                 instructions=self.instructions_text,
                 memory=self.memory,
             )
-            self.logger.info(
+            self.log_event(
+                logging.INFO,
+                "TASK_EXECUTE_RESULT",
                 "[%s] Task %s execution result: status=%s, outputs=%s, notes=%s",
                 self.agent_name,
                 node.id,
                 execution.status,
                 execution.outputs,
                 execution.notes[:200] if execution.notes else "None",
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state=execution.status.strip().lower() or "running",
             )
 
             if execution.follow_ups:
@@ -384,7 +533,17 @@ class AgentRuntime(BaseLogger):
                     execution.follow_ups,
                 )
 
-            self.logger.info("[%s] Generating summary for task %s", self.agent_name, node.id)
+            self.log_event(
+                logging.INFO,
+                "TASK_SUMMARY_START",
+                "[%s] Generating summary for task %s",
+                self.agent_name,
+                node.id,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="running",
+            )
             summary = self.llm_client.summarize_task(
                 node,
                 execution,
@@ -392,16 +551,48 @@ class AgentRuntime(BaseLogger):
                 instructions=self.instructions_text,
                 memory=self.memory,
             )
-            self.logger.info("[%s] Task %s summary: %s", self.agent_name, node.id, summary[:200])
+            self.log_event(
+                logging.INFO,
+                "TASK_SUMMARY_DONE",
+                "[%s] Task %s summary: %s",
+                self.agent_name,
+                node.id,
+                summary[:200],
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="running",
+            )
             self._record_result(node, execution, summary)
         except Exception as exc:
-            self.logger.error("[%s] Task %s failed: %s", self.agent_name, node.id, exc)
+            self.log_event(
+                logging.ERROR,
+                "TASK_FAILED",
+                "[%s] Task %s failed: %s",
+                self.agent_name,
+                node.id,
+                exc,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="error",
+            )
             self.logger.exception("Full exception details:")
             self._record_failure_or_recovery(node, str(exc))
         finally:
             self.llm_client.set_progress_callback(self._make_progress_callback())
             self.redis_store.release_execution_guard(node.id, guard_token)
-            self.logger.info("[%s] Releasing lock for task %s", self.agent_name, node.id)
+            self.log_event(
+                logging.INFO,
+                "TASK_LOCK_RELEASED",
+                "[%s] Releasing lock for task %s",
+                self.agent_name,
+                node.id,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="active",
+            )
             self.redis_store.release_lock(node.id, self.agent_name)
 
     def _record_result(self, node: TaskNode, execution: TaskExecutionResult, summary: str) -> None:
@@ -687,3 +878,73 @@ class AgentRuntime(BaseLogger):
         if state.status in {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.INTEGRATED}:
             return False
         return True
+
+    def _ready_role_counts(self, ready_task_ids: list[str]) -> dict[str, int]:
+        """Return role histogram for currently ready tasks."""
+        counts: dict[str, int] = {}
+        for task_id in ready_task_ids:
+            node = self.redis_store.get_task_node(self.goal_id, task_id)
+            if not node:
+                continue
+            role = node.metadata.get("required_role", "unassigned")
+            counts[role] = counts.get(role, 0) + 1
+        return counts
+
+    def _emit_goal_state(
+        self,
+        ready_task_ids: list[str],
+        ready_role_counts: dict[str, int],
+        *,
+        eligible_count: int,
+    ) -> None:
+        """Emit one-shot goal completion/blocked summaries when state changes."""
+        counts = self.redis_store.goal_status_counts(self.goal_id)
+        ready_count = len(ready_task_ids)
+        running_count = counts.get(TaskStatus.RUNNING, 0) + counts.get(TaskStatus.CLAIMED, 0)
+        blocked_count = counts.get(TaskStatus.BLOCKED, 0)
+        done_count = counts.get(TaskStatus.DONE, 0)
+        failed_count = counts.get(TaskStatus.FAILED, 0)
+
+        if ready_count == 0 and running_count == 0 and blocked_count == 0:
+            signature = f"complete:{done_count}:{failed_count}"
+            if signature != self._last_goal_state_signature:
+                self.log_event(
+                    logging.INFO,
+                    "GOAL_COMPLETE",
+                    "[%s] Goal %s complete: 0 tasks left (done=%d, failed=%d)",
+                    self.agent_name,
+                    self.goal_id,
+                    done_count,
+                    failed_count,
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    state="complete",
+                )
+            self._last_goal_state_signature = signature
+            return
+
+        if ready_count > 0 and eligible_count == 0:
+            active_roles = self.redis_store.active_roles()
+            required_roles = set(ready_role_counts)
+            inactive_required_roles = sorted(required_roles - active_roles)
+            if inactive_required_roles:
+                signature = f"blocked-inactive:{ready_count}:{','.join(inactive_required_roles)}"
+                if signature != self._last_goal_state_signature:
+                    self.log_event(
+                        logging.WARNING,
+                        "GOAL_BLOCKED_INACTIVE_ROLE",
+                        "[%s] Goal %s blocked: %d ready tasks require inactive roles %s",
+                        self.agent_name,
+                        self.goal_id,
+                        ready_count,
+                        ", ".join(inactive_required_roles),
+                        goal=self.goal_id,
+                        role=self.agent_role,
+                        state="blocked",
+                    )
+                self._last_goal_state_signature = signature
+                return
+
+        self._last_goal_state_signature = (
+            f"active:{ready_count}:{eligible_count}:{blocked_count}:{running_count}"
+        )

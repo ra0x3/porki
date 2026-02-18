@@ -117,6 +117,16 @@ def _estimate_token_count(text: str) -> tuple[int, str]:
     return max(1, len(text) // 4), "fallback:chars_div_4"
 
 
+def _log_event(level: int, event: str, message: str, *args, **context) -> None:
+    """Emit module log with structured event fields."""
+    extra = {"evt": event}
+    for key, value in context.items():
+        if value is None:
+            continue
+        extra[key] = str(value)
+    logger.log(level, message, *args, extra=extra)
+
+
 class LLMClient:
     """Abstract interface for LLM interactions."""
 
@@ -482,7 +492,9 @@ class ClaudeCLIClient(LLMClient):
             ]
 
         provider_name = self.executable
-        logger.info(
+        _log_event(
+            logging.INFO,
+            "LLM_INVOKE",
             "Invoking %s for %s Prompt(%s): chars=%d tokens~=%d tokenizer=%s timeout=%ss",
             provider_name,
             operation,
@@ -491,6 +503,8 @@ class ClaudeCLIClient(LLMClient):
             prompt_meta.token_estimate,
             prompt_meta.tokenizer,
             timeout,
+            task=prompt_meta.id,
+            state="running",
         )
         logger.debug("Executing command: %s", " ".join(cmd))
 
@@ -520,10 +534,14 @@ class ClaudeCLIClient(LLMClient):
                         )
                     if now >= next_progress:
                         remaining = int(max(0, deadline - now))
-                        logger.info(
+                        _log_event(
+                            logging.INFO,
+                            "LLM_WAIT",
                             "Waiting for LLM response for Prompt(%s): %ds left",
                             prompt_meta.id,
                             remaining,
+                            task=prompt_meta.id,
+                            state="running",
                         )
                         next_progress = now + self.PROGRESS_LOG_INTERVAL_SECONDS
                     if now >= next_keepalive:
@@ -543,7 +561,9 @@ class ClaudeCLIClient(LLMClient):
             response_text = stdout.strip()
             response_tokens, response_tokenizer = _estimate_token_count(response_text or " ")
             stderr_text = (stderr or "").strip()
-            logger.info(
+            _log_event(
+                logging.INFO,
+                "LLM_RESPONSE",
                 "%s response for %s Prompt(%s): chars=%d tokens~=%d tokenizer=%s duration_ms=%d "
                 "exit_code=%d",
                 provider_name,
@@ -554,6 +574,8 @@ class ClaudeCLIClient(LLMClient):
                 response_tokenizer,
                 elapsed_ms,
                 process.returncode,
+                task=prompt_meta.id,
+                state="running",
             )
 
             logger.debug("stderr: %s", (stderr_text or "")[:500])
@@ -569,13 +591,19 @@ class ClaudeCLIClient(LLMClient):
                     combined_error_text or error_text
                 )
                 if wait_seconds is None:
-                    logger.error(
+                    _log_event(
+                        logging.ERROR,
+                        "LLM_SPENDING_CAP_PARSE_FAILED",
                         "Spending cap reached but reset time could not be parsed: %s",
                         combined_error_text or error_text,
+                        task=prompt_meta.id,
+                        state="error",
                     )
                 else:
                     reset_at = datetime.now().astimezone() + timedelta(seconds=wait_seconds)
-                    logger.warning(
+                    _log_event(
+                        logging.WARNING,
+                        "LLM_SPENDING_CAP",
                         "%s spending cap reached for %s Prompt(%s): %s. "
                         "Sleeping %.0fs until local reset at %s before retry.",
                         provider_name,
@@ -584,6 +612,9 @@ class ClaudeCLIClient(LLMClient):
                         combined_error_text or error_text,
                         wait_seconds,
                         reset_at.isoformat(timespec="seconds"),
+                        task=prompt_meta.id,
+                        state="backoff",
+                        next_retry=reset_at.isoformat(timespec="seconds"),
                     )
                     if self._on_spending_cap is not None:
                         self._on_spending_cap(wait_seconds)
@@ -648,13 +679,17 @@ class ClaudeCLIClient(LLMClient):
             except ValueError as exc:
                 last_error = exc
                 snippet = raw[:240].replace("\n", "\\n")
-                logger.warning(
+                _log_event(
+                    logging.WARNING,
+                    "LLM_INVALID_JSON",
                     "Invalid JSON response from Claude (attempt %d/%d): %s; len=%d; snippet=%r",
                     attempt,
                     max_attempts,
                     exc,
                     len(raw),
                     snippet,
+                    task=operation,
+                    state="error",
                 )
                 if attempt >= max_attempts:
                     break
