@@ -368,7 +368,7 @@ def test_agent_retries_stale_running_task_after_restart(redis_store, tmp_path):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-crashed",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=1),
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
         ),
     )
 

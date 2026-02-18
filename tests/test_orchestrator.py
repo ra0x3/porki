@@ -177,7 +177,7 @@ agents:
         TaskState(
             status=TaskStatus.RUNNING,
             owner="dead-agent",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=1),
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
         ),
     )
 

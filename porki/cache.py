@@ -28,6 +28,9 @@ def _now_utc() -> datetime:
 class RedisStore(BaseLogger):
     """Serialization helpers on top of a Redis client."""
 
+    STALE_LEASE_GRACE = timedelta(seconds=15)
+    STALE_HEARTBEAT_GRACE = timedelta(seconds=90)
+
     def __init__(self, client: LocalRedisClient):
         """Initialize the store with a Redis client."""
         super().__init__(f"{self.__class__.__name__}")
@@ -319,14 +322,22 @@ class RedisStore(BaseLogger):
             if state.status not in {TaskStatus.RUNNING, TaskStatus.CLAIMED}:
                 continue
 
+            if state.status == TaskStatus.RUNNING and self.execution_guard_owner(node.id):
+                continue
+
             lock_owner = self.lock_owner(node.id)
             lock_missing = lock_owner is None
-            lease_expired = bool(state.lease_expires and state.lease_expires <= now)
-            if not lock_missing and not lease_expired:
+            lease_expired_with_grace = bool(
+                state.lease_expires and (now - state.lease_expires) >= self.STALE_LEASE_GRACE
+            )
+            if not lock_missing and not lease_expired_with_grace:
                 continue
+
             if state.owner:
                 last_heartbeat = self.agent_last_heartbeat(state.owner)
-                if last_heartbeat and (now - last_heartbeat) < timedelta(seconds=45):
+                if last_heartbeat and (now - last_heartbeat) < self.STALE_HEARTBEAT_GRACE:
+                    continue
+                if not last_heartbeat and not lease_expired_with_grace:
                     continue
 
             recovered_state = state.model_copy(
@@ -454,6 +465,13 @@ class RedisStore(BaseLogger):
         owner = value.decode("utf-8") if isinstance(value, bytes) else value
         if owner == token:
             self.client.delete(key)
+
+    def execution_guard_owner(self, task_id: str) -> str | None:
+        """Return execution guard owner token for a task, if any."""
+        value = self.client.get(self._execution_guard_key(task_id))
+        if not value:
+            return None
+        return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
     def store_memory_snapshot(self, agent_name: str, entries: Iterable[str]) -> None:
         """Persist an agent memory snapshot."""

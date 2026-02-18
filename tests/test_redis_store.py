@@ -46,7 +46,7 @@ def test_list_ready_tasks_recovers_stale_running(redis_store):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-crashed",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=1),
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
         ),
     )
 
@@ -92,6 +92,58 @@ def test_recover_stale_skips_active_owner_with_recent_heartbeat(redis_store):
     state = redis_store.get_task_state("t1")
     assert state is not None
     assert state.status is TaskStatus.RUNNING
+
+
+def test_recover_stale_skips_running_with_execution_guard(redis_store):
+    """Running task with active execution guard should not be recovered."""
+    dag = DagModel(
+        goal_id="goal-exec-guard", nodes=[TaskNode(id="t1", title="T1", priority=1)], edges=[]
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state(
+        "t1",
+        TaskState(
+            status=TaskStatus.RUNNING,
+            owner="agent-live",
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
+        ),
+    )
+    assert redis_store.acquire_execution_guard("t1", "agent-live:token", timedelta(seconds=120))
+
+    ready = redis_store.list_ready_tasks("goal-exec-guard")
+    assert ready == []
+
+    state = redis_store.get_task_state("t1")
+    assert state is not None
+    assert state.status is TaskStatus.RUNNING
+
+
+def test_recover_stale_respects_lease_grace_without_heartbeat(redis_store):
+    """Recent lease expiry should not recover immediately when heartbeat is absent."""
+    dag = DagModel(
+        goal_id="goal-lease-grace", nodes=[TaskNode(id="t1", title="T1", priority=1)], edges=[]
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state(
+        "t1",
+        TaskState(
+            status=TaskStatus.RUNNING,
+            owner="agent-missing-heartbeat",
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ),
+    )
+
+    assert redis_store.list_ready_tasks("goal-lease-grace") == []
+
+    redis_store.update_task_state(
+        "t1",
+        TaskState(
+            status=TaskStatus.RUNNING,
+            owner="agent-missing-heartbeat",
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
+        ),
+    )
+    assert redis_store.list_ready_tasks("goal-lease-grace") == ["t1"]
 
 
 def test_agent_active_slot_lifecycle(redis_store):
