@@ -39,6 +39,22 @@ def test_execute_task_retries_after_empty_output(monkeypatch):
     assert result.outputs == ["artifact://x"]
 
 
+def test_run_prompt_uses_direct_invoke(monkeypatch):
+    """One-shot prompt mode should call the provider with run_prompt operation."""
+    client = ClaudeCLIClient(executable="claude")
+    observed: list[tuple[str, int, str]] = []
+
+    def fake_invoke(prompt: str, *, timeout: int = 180, operation: str = "llm_call") -> str:
+        observed.append((prompt, timeout, operation))
+        return "ok"
+
+    monkeypatch.setattr(client, "_invoke", fake_invoke)
+
+    output = client.run_prompt("hello")
+    assert output == "ok"
+    assert observed == [("hello", 180, "run_prompt")]
+
+
 def test_execute_task_retries_after_missing_required_keys(monkeypatch):
     """Client should retry when JSON shape is missing required keys."""
     client = ClaudeCLIClient(executable="claude")
@@ -292,6 +308,12 @@ def test_create_llm_client_supports_codex_provider():
     config = LLMRuntimeConfig(provider="codex", executable="codex", extra_args=("--x",))
     client = create_llm_client(config)
     assert isinstance(client, CodexCLIClient)
+
+
+def test_create_llm_client_ignores_fakeredis_url_for_concurrency():
+    """Factory should not open a real redis client for fakeredis URL scheme."""
+    config = LLMRuntimeConfig(provider="codex", executable="codex", extra_args=("--x",))
+    create_llm_client(config, redis_url="fakeredis://")
 
 
 def test_invoke_adds_provider_specific_bypass_args(monkeypatch):

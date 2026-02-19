@@ -130,6 +130,10 @@ def _log_event(level: int, event: str, message: str, *args, **context) -> None:
 class LLMClient:
     """Abstract interface for LLM interactions."""
 
+    def run_prompt(self, prompt: str) -> str:
+        """Run a one-shot prompt and return raw provider output."""
+        raise NotImplementedError
+
     def create_goal_dag(self, instructions: str, *, goal_id: str) -> DagModel:
         """Create a DAG model for the goal from instructions."""
         raise NotImplementedError
@@ -240,7 +244,12 @@ class ClaudeCLIClient(LLMClient):
                 concurrency_wait_seconds = 120.0
         self._concurrency_wait_seconds = concurrency_wait_seconds
         self._redis = None
-        if redis_url and redis is not None and self._max_concurrency > 0:
+        if (
+            redis_url
+            and not redis_url.startswith("fakeredis://")
+            and redis is not None
+            and self._max_concurrency > 0
+        ):
             self._redis = redis.Redis.from_url(redis_url)
 
     def set_spending_cap_callback(self, callback: Callable[[float], None] | None) -> None:
@@ -250,6 +259,10 @@ class ClaudeCLIClient(LLMClient):
     def set_progress_callback(self, callback: Callable[[], None] | None) -> None:
         """Install callback invoked while waiting for long-running provider calls."""
         self._on_progress = callback
+
+    def run_prompt(self, prompt: str) -> str:
+        """Run a direct prompt against the configured CLI provider."""
+        return self._invoke(prompt, operation="run_prompt")
 
     def create_goal_dag(self, instructions: str, *, goal_id: str) -> DagModel:
         """Request a DAG from Claude and validate it."""
@@ -817,6 +830,10 @@ class StubLLMClient(LLMClient):
     def __init__(self, dag_blueprint: DagModel | None = None):
         """Initialize optional fixed DAG blueprint for tests."""
         self.dag_blueprint = dag_blueprint
+
+    def run_prompt(self, prompt: str) -> str:
+        """Return deterministic output for one-shot prompt invocations."""
+        return prompt.strip() or "stub:empty-prompt"
 
     def create_goal_dag(self, instructions: str, *, goal_id: str) -> DagModel:
         """Generate a simple deterministic DAG from bullet list text."""

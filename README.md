@@ -51,10 +51,18 @@ pip install porki
 porki --help
 ```
 
+```bash
+porki run --help
+```
+
+```bash
+porki instructions --help
+```
+
 Minimal runtime example (orchestrator + agent) with bundled test assets:
 
 ```bash
-porki \
+porki run \
   --role orchestrator \
   --instructions tests/assets/INSTRUCTIONS.md \
   --llm-provider codex \
@@ -62,7 +70,7 @@ porki \
 ```
 
 ```bash
-porki \
+porki run \
   --role agent \
   --instructions tests/assets/instructions/agent-research.md \
   --heartbeat tests/assets/instructions/heartbeat/agent-research.md \
@@ -70,6 +78,27 @@ porki \
   --goal-id goal-demo \
   --llm-provider codex \
   --llm-cli codex
+```
+
+One-shot prompt mode:
+
+```bash
+porki run --prompt "Draft a concise architecture summary for this repo."
+```
+
+Create a template instruction file:
+
+```bash
+porki instructions create --name "Core infra dev" --path ./instructions
+```
+
+Generated templates now include canonical JSON schema examples for goals, DAG tasks, task state, finished tasks, and LLM response payloads.
+Each generated file also includes explicit version metadata (`porki_instruction_template_version` and `porki_schema_version`) so upgrades are trackable.
+
+Example output path from the command above:
+
+```bash
+./instructions/CORE_INFRA_DEV.md
 ```
 
 By default, `--redis-url` is `fakeredis://` for local/demo usage.
@@ -123,58 +152,42 @@ python -m pytest
 ## CLI Reference
 
 ```text
-usage: porki [-h] --role {agent,orchestrator} --instructions INSTRUCTIONS
-             [--redis-url REDIS_URL] [--log-level LOG_LEVEL]
-             [--agent-name AGENT_NAME] [--agent-role AGENT_ROLE]
-             [--goal-id GOAL_ID] [--heartbeat HEARTBEAT]
-             [--loop-interval LOOP_INTERVAL] [--lease-ttl LEASE_TTL]
-             [--poll-interval POLL_INTERVAL]
-             [--heartbeat-interval HEARTBEAT_INTERVAL]
-             [--instruction-interval INSTRUCTION_INTERVAL]
-             [--claude-cli CLAUDE_CLI] [--claude-extra-arg CLAUDE_EXTRA_ARG]
-             [--claude-use-sysg] [--llm-provider {claude,codex}]
-             [--llm-cli LLM_CLI] [--llm-extra-arg LLM_EXTRA_ARG]
-             [--llm-use-sysg]
+usage: porki [-h] [--version] {run,instructions} ...
 
-Porki agent/orchestrator entrypoint
+Porki agent/orchestrator entrypoint (version X.Y.Z)
+
+positional arguments:
+  {run,instructions}
+    run               Run orchestrator/agent loops or submit a one-shot prompt
+                      to the configured LLM
+    instructions      Instruction file utilities
 
 options:
-  -h, --help            show this help message and exit
-  --role {agent,orchestrator}
-                        Process role
-  --instructions INSTRUCTIONS
-                        Primary instructions file
-  --redis-url REDIS_URL
-                        Redis connection URL
-  --log-level LOG_LEVEL
-                        Python logging level
-  --agent-name AGENT_NAME
-                        Agent identifier when running in agent mode
-  --agent-role AGENT_ROLE
-                        Agent role identifier when running in agent mode
-  --goal-id GOAL_ID     Goal identifier for the active DAG
-  --heartbeat HEARTBEAT
-                        Heartbeat file path for agent role
-  --loop-interval LOOP_INTERVAL
-                        Agent loop interval in seconds
-  --lease-ttl LEASE_TTL
-                        Lease TTL in seconds
-  --poll-interval POLL_INTERVAL
-                        Orchestrator poll interval in seconds
-  --heartbeat-interval HEARTBEAT_INTERVAL
-                        Agent heartbeat file read interval in seconds
-  --instruction-interval INSTRUCTION_INTERVAL
-                        Agent instructions reload interval in seconds
-  --claude-cli CLAUDE_CLI
-                        Path to the Claude CLI executable
-  --claude-extra-arg CLAUDE_EXTRA_ARG
-                        Additional arguments for the Claude CLI
-  --claude-use-sysg     Invoke Claude through `sysg spawn --ttl` to capture
-                        stdout/stderr
-  --llm-provider {claude,codex}
-                        LLM provider used for orchestration and agents
-  --llm-cli LLM_CLI     Path to provider CLI executable
-  --llm-extra-arg LLM_EXTRA_ARG
-                        Additional arguments for the selected LLM CLI
-  --llm-use-sysg        Invoke LLM CLI through `sysg spawn` for output capture
+  -h, --help          show this help message and exit
+  --version           Show version and exit
+```
+
+```text
+usage: porki run [-h] [--role {agent,orchestrator}]
+                 [--instructions INSTRUCTIONS] [-p [PROMPT]]
+                 [--redis-url REDIS_URL] [--log-level LOG_LEVEL]
+                 [--agent-name AGENT_NAME] [--agent-role AGENT_ROLE]
+                 [--goal-id GOAL_ID] [--heartbeat HEARTBEAT]
+                 [--loop-interval LOOP_INTERVAL] [--lease-ttl LEASE_TTL]
+                 [--poll-interval POLL_INTERVAL]
+                 [--heartbeat-interval HEARTBEAT_INTERVAL]
+                 [--instruction-interval INSTRUCTION_INTERVAL]
+                 [--claude-cli CLAUDE_CLI]
+                 [--claude-extra-arg CLAUDE_EXTRA_ARG] [--claude-use-sysg]
+                 [--llm-provider {claude,codex}] [--llm-cli LLM_CLI]
+                 [--llm-extra-arg LLM_EXTRA_ARG] [--llm-use-sysg]
+```
+
+```text
+usage: porki instructions [-h] [--log-level LOG_LEVEL] {create} ...
+```
+
+```text
+usage: porki instructions create [-h] -n NAME -p PATH [--force]
+                                 [--log-level LOG_LEVEL]
 ```
