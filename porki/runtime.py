@@ -84,6 +84,7 @@ class AgentRuntime(BaseLogger):
         self._last_queue_snapshot: tuple[int, int, tuple[tuple[str, int], ...]] | None = None
         self._last_goal_state_signature: str | None = None
         self._last_idle_log: datetime = datetime.fromtimestamp(0, tz=timezone.utc)
+        self._auto_unblock_exhausted_logged: set[str] = set()
 
         self._hydrate_memory()
         self.llm_client.set_spending_cap_callback(self._on_spending_cap)
@@ -986,6 +987,11 @@ class AgentRuntime(BaseLogger):
 
     def _attempt_auto_unblock_failed_dependencies(self) -> bool:
         """Create recovery work when blocked tasks depend on failed prerequisites."""
+        if not self._is_auto_unblock_coordinator():
+            return False
+        if not self._acquire_auto_unblock_coordinator_slot():
+            return False
+
         dag = self.redis_store.read_dag(self.goal_id)
         if not dag:
             return False
@@ -1054,19 +1060,9 @@ class AgentRuntime(BaseLogger):
                 int(node.metadata.get("recovery_attempt", "0")),
             )
             if attempts >= self.MAX_RECOVERY_ATTEMPTS:
-                self.log_event(
-                    logging.WARNING,
-                    "AUTO_UNBLOCK_EXHAUSTED",
-                    "[%s] Failed dependency %s exhausted auto-recovery attempts (%d/%d)",
-                    self.agent_name,
-                    failed_task_id,
-                    attempts,
-                    self.MAX_RECOVERY_ATTEMPTS,
-                    goal=self.goal_id,
-                    role=self.agent_role,
-                    task=failed_task_id,
-                    state="blocked",
-                )
+                if self._ensure_exhaustion_escalation(node, state, failed_task_id, attempts):
+                    return True
+                self._log_auto_unblock_exhausted_once(failed_task_id, attempts)
                 return False
 
             attempt = attempts + 1
@@ -1118,6 +1114,93 @@ class AgentRuntime(BaseLogger):
             return True
         finally:
             self.redis_store.release_lock(failed_task_id, self.agent_name)
+
+    def _is_auto_unblock_coordinator(self) -> bool:
+        """Return whether this runtime is allowed to perform auto-unblock decisions."""
+        return self.agent_role in {"owner", "team-lead"}
+
+    def _acquire_auto_unblock_coordinator_slot(self) -> bool:
+        """Claim a short-lived per-goal slot so only one coordinator evaluates unblock logic."""
+        key = f"goal:{self.goal_id}:auto_unblock:coordinator"
+        token = f"{self.agent_name}:{self._pid}"
+        return bool(self.redis_store.client.set(key, token, nx=True, px=5000))
+
+    def _ensure_exhaustion_escalation(
+        self,
+        node: TaskNode,
+        state: TaskState,
+        failed_task_id: str,
+        attempts: int,
+    ) -> bool:
+        """Create one escalation remediation task when regular recovery attempts are exhausted."""
+        if node.metadata.get("auto_unblock_escalated") == "1":
+            self._log_auto_unblock_exhausted_once(failed_task_id, attempts)
+            return False
+
+        escalation_attempt = attempts + 1
+        node.metadata["auto_unblock_escalated"] = "1"
+        node.metadata["recovery_attempts"] = str(escalation_attempt)
+        self.redis_store.update_task_node(self.goal_id, node)
+
+        escalation_id = self.redis_store.create_recovery_task(
+            goal_id=self.goal_id,
+            blocked_task_id=failed_task_id,
+            recovery_root_id=failed_task_id,
+            owner_role=(node.metadata.get("manager_role") or self.agent_role or "owner"),
+            recovery_attempt=escalation_attempt,
+            priority=max(0, node.priority + 3),
+            title=f"Escalation: recover exhausted dependency {failed_task_id}",
+        )
+
+        progress = (
+            f"Auto-unblock escalation created {escalation_id} after exhausted recovery "
+            f"attempts ({attempts}/{self.MAX_RECOVERY_ATTEMPTS})."
+        )
+        self.redis_store.update_task_state(
+            failed_task_id,
+            TaskState(
+                status=TaskStatus.BLOCKED,
+                progress=progress,
+                last_error=state.last_error,
+            ),
+        )
+        self.memory.append(progress)
+        self.redis_store.store_memory_snapshot(self.agent_name, self.memory.snapshot())
+        self.log_event(
+            logging.WARNING,
+            "AUTO_UNBLOCK_ESCALATED",
+            "[%s] Escalated failed dependency %s with remediation task %s after %d/%d attempts",
+            self.agent_name,
+            failed_task_id,
+            escalation_id,
+            attempts,
+            self.MAX_RECOVERY_ATTEMPTS,
+            goal=self.goal_id,
+            role=self.agent_role,
+            task=failed_task_id,
+            state="active",
+        )
+        return True
+
+    def _log_auto_unblock_exhausted_once(self, failed_task_id: str, attempts: int) -> None:
+        """Emit exhausted warning once per task/attempts tuple."""
+        signature = f"{failed_task_id}:{attempts}"
+        if signature in self._auto_unblock_exhausted_logged:
+            return
+        self._auto_unblock_exhausted_logged.add(signature)
+        self.log_event(
+            logging.WARNING,
+            "AUTO_UNBLOCK_EXHAUSTED",
+            "[%s] Failed dependency %s exhausted auto-recovery attempts (%d/%d)",
+            self.agent_name,
+            failed_task_id,
+            attempts,
+            self.MAX_RECOVERY_ATTEMPTS,
+            goal=self.goal_id,
+            role=self.agent_role,
+            task=failed_task_id,
+            state="blocked",
+        )
 
     def _existing_recovery_dependencies(self, task_id: str) -> list[str]:
         """Return active remediation dependency task IDs for a task."""

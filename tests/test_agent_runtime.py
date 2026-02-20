@@ -874,7 +874,9 @@ def test_startup_logs_stale_recovery_summary(redis_store, tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         agent.run(max_cycles=1)
 
-    resume_logs = [rec for rec in caplog.records if "Startup recovered 1 stale task(s)" in rec.getMessage()]
+    resume_logs = [
+        rec for rec in caplog.records if "Startup recovered 1 stale task(s)" in rec.getMessage()
+    ]
     assert len(resume_logs) == 1
 
 
@@ -912,8 +914,8 @@ def test_auto_unblocks_when_blocked_by_failed_dependency(redis_store, tmp_path, 
     heartbeat_path.write_text("RESUME\n", encoding="utf-8")
 
     agent = AgentRuntime(
-        agent_name="features-dev",
-        agent_role="features-dev",
+        agent_name="owner",
+        agent_role="owner",
         goal_id=goal_id,
         instructions_path=instructions_path,
         heartbeat_path=heartbeat_path,
@@ -926,12 +928,122 @@ def test_auto_unblocks_when_blocked_by_failed_dependency(redis_store, tmp_path, 
 
     dag_after = redis_store.read_dag(goal_id)
     assert dag_after is not None
-    recovery_ids = sorted(node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_"))
+    recovery_ids = sorted(
+        node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_")
+    )
     assert len(recovery_ids) == 1
 
     failed_state = redis_store.get_task_state("task-failed")
     assert failed_state is not None
     assert failed_state.status is TaskStatus.BLOCKED
 
-    triggered_logs = [rec for rec in caplog.records if "Auto-unblock for failed dependency task-failed" in rec.getMessage()]
+    triggered_logs = [
+        rec
+        for rec in caplog.records
+        if "Auto-unblock for failed dependency task-failed" in rec.getMessage()
+    ]
     assert len(triggered_logs) == 1
+
+
+def test_non_coordinator_does_not_run_auto_unblock(redis_store, tmp_path):
+    """Non-owner/team-lead runtimes should not mutate failed dependency deadlocks."""
+    goal_id = "goal-auto-unblock-non-coordinator"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(id="task-failed", title="Failed prerequisite", priority=3),
+            TaskNode(id="task-blocked", title="Downstream work", priority=2),
+        ],
+        edges=[TaskEdge(source="task-failed", target="task-blocked")],
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state("task-failed", TaskState(status=TaskStatus.FAILED))
+    redis_store.update_task_state("task-blocked", TaskState(status=TaskStatus.BLOCKED))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="features-dev",
+        agent_role="features-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    agent.run(max_cycles=1)
+
+    failed_state = redis_store.get_task_state("task-failed")
+    assert failed_state is not None
+    assert failed_state.status is TaskStatus.FAILED
+    dag_after = redis_store.read_dag(goal_id)
+    assert dag_after is not None
+    recovery_ids = [
+        node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_")
+    ]
+    assert recovery_ids == []
+
+
+def test_exhausted_auto_unblock_escalates_once(redis_store, tmp_path, caplog):
+    """Exhausted failed dependencies should create one escalation remediation task."""
+    goal_id = "goal-auto-unblock-escalation"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-failed",
+                title="Failed prerequisite",
+                priority=3,
+                metadata={"recovery_attempts": "3"},
+            ),
+            TaskNode(id="task-blocked", title="Downstream work", priority=2),
+        ],
+        edges=[TaskEdge(source="task-failed", target="task-blocked")],
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state("task-failed", TaskState(status=TaskStatus.FAILED))
+    redis_store.update_task_state("task-blocked", TaskState(status=TaskStatus.BLOCKED))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="owner",
+        agent_role="owner",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.WARNING):
+        agent.run(max_cycles=2)
+
+    dag_after = redis_store.read_dag(goal_id)
+    assert dag_after is not None
+    escalation_ids = sorted(
+        node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_4")
+    )
+    assert len(escalation_ids) == 1
+
+    failed_state = redis_store.get_task_state("task-failed")
+    assert failed_state is not None
+    assert failed_state.status is TaskStatus.BLOCKED
+
+    escalated_logs = [
+        rec
+        for rec in caplog.records
+        if "Escalated failed dependency task-failed" in rec.getMessage()
+    ]
+    assert len(escalated_logs) == 1
+    exhausted_logs = [
+        rec for rec in caplog.records if "exhausted auto-recovery attempts" in rec.getMessage()
+    ]
+    assert exhausted_logs == []
