@@ -16,7 +16,7 @@ from .constants import AGENT_LOOP_INTERVAL, HEARTBEAT_REFRESH_INTERVAL, INSTRUCT
 from .heartbeat import HeartbeatController, HeartbeatDirective
 from .llm import LLMClient, RecoveryDecision, TaskExecutionResult
 from .memory import Memory
-from .models import DEFAULT_LEASE_TTL, TaskNode, TaskState, TaskStatus
+from .models import DEFAULT_LEASE_TTL, DagModel, TaskNode, TaskState, TaskStatus
 from .version import BaseLogger, InstructionStore
 
 
@@ -342,6 +342,9 @@ class AgentRuntime(BaseLogger):
         ready_task_ids = self.redis_store.list_ready_tasks(self.goal_id)
         ready_role_counts = self._ready_role_counts(ready_task_ids)
         if not ready_task_ids:
+            if self._attempt_auto_unblock_failed_dependencies():
+                self._last_queue_snapshot = None
+                return
             self._emit_goal_state(ready_task_ids, ready_role_counts, eligible_count=0)
             self._emit_idle_heartbeat(reason="queue-empty", ready_count=0, eligible_count=0)
             if self._last_queue_snapshot != (0, 0, ()):
@@ -980,6 +983,157 @@ class AgentRuntime(BaseLogger):
         self._last_goal_state_signature = (
             f"active:{ready_count}:{eligible_count}:{blocked_count}:{running_count}"
         )
+
+    def _attempt_auto_unblock_failed_dependencies(self) -> bool:
+        """Create recovery work when blocked tasks depend on failed prerequisites."""
+        dag = self.redis_store.read_dag(self.goal_id)
+        if not dag:
+            return False
+
+        blocking_failed_ids: set[str] = set()
+        for node in dag.nodes:
+            state = self.redis_store.get_task_state(node.id)
+            if not state or state.status != TaskStatus.BLOCKED:
+                continue
+            for dep_id in dag.dependencies_for(node.id):
+                dep_state = self.redis_store.get_task_state(dep_id)
+                if dep_state and dep_state.status == TaskStatus.FAILED:
+                    blocking_failed_ids.add(dep_id)
+
+        if not blocking_failed_ids:
+            return False
+
+        triggered = 0
+        for failed_id in sorted(blocking_failed_ids):
+            if self._recover_failed_dependency(dag, failed_id):
+                triggered += 1
+
+        return triggered > 0
+
+    def _recover_failed_dependency(self, dag: DagModel, failed_task_id: str) -> bool:
+        """Convert a failed prerequisite into remediation workflow."""
+        node = self.redis_store.get_task_node(self.goal_id, failed_task_id)
+        state = self.redis_store.get_task_state(failed_task_id)
+        if not node or not state or state.status != TaskStatus.FAILED:
+            return False
+
+        if not self.redis_store.acquire_lock(failed_task_id, self.agent_name, self.lease_ttl):
+            return False
+
+        try:
+            state = self.redis_store.get_task_state(failed_task_id)
+            if not state or state.status != TaskStatus.FAILED:
+                return False
+
+            recovery_deps = self._existing_recovery_dependencies(failed_task_id)
+            if recovery_deps:
+                self.redis_store.update_task_state(
+                    failed_task_id,
+                    TaskState(
+                        status=TaskStatus.BLOCKED,
+                        progress=f"Awaiting remediation task(s): {', '.join(recovery_deps)}",
+                        last_error=state.last_error,
+                    ),
+                )
+                self.log_event(
+                    logging.INFO,
+                    "AUTO_UNBLOCK_REATTACH",
+                    "[%s] Reattached failed dependency %s to existing remediation task(s): %s",
+                    self.agent_name,
+                    failed_task_id,
+                    ", ".join(recovery_deps),
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    task=failed_task_id,
+                    state="blocked",
+                )
+                return True
+
+            attempts = max(
+                int(node.metadata.get("recovery_attempts", "0")),
+                int(node.metadata.get("recovery_attempt", "0")),
+            )
+            if attempts >= self.MAX_RECOVERY_ATTEMPTS:
+                self.log_event(
+                    logging.WARNING,
+                    "AUTO_UNBLOCK_EXHAUSTED",
+                    "[%s] Failed dependency %s exhausted auto-recovery attempts (%d/%d)",
+                    self.agent_name,
+                    failed_task_id,
+                    attempts,
+                    self.MAX_RECOVERY_ATTEMPTS,
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    task=failed_task_id,
+                    state="blocked",
+                )
+                return False
+
+            attempt = attempts + 1
+            node.metadata["recovery_attempts"] = str(attempt)
+            self.redis_store.update_task_node(self.goal_id, node)
+
+            recovery_id = self.redis_store.create_recovery_task(
+                goal_id=self.goal_id,
+                blocked_task_id=failed_task_id,
+                recovery_root_id=failed_task_id,
+                owner_role=(
+                    node.metadata.get("manager_role")
+                    or node.metadata.get("required_role")
+                    or self.agent_role
+                ),
+                recovery_attempt=attempt,
+                priority=max(0, node.priority + 2),
+                title=f"Recover failed dependency {failed_task_id}",
+            )
+
+            dependents = sum(1 for edge in dag.edges if edge.source == failed_task_id)
+            progress = (
+                f"Auto-unblock created remediation task {recovery_id} for failed dependency "
+                f"{failed_task_id} (attempt {attempt}/{self.MAX_RECOVERY_ATTEMPTS})."
+            )
+            self.redis_store.update_task_state(
+                failed_task_id,
+                TaskState(
+                    status=TaskStatus.BLOCKED,
+                    progress=progress,
+                    last_error=state.last_error,
+                ),
+            )
+            self.memory.append(progress)
+            self.redis_store.store_memory_snapshot(self.agent_name, self.memory.snapshot())
+            self.log_event(
+                logging.INFO,
+                "AUTO_UNBLOCK_TRIGGERED",
+                "[%s] Auto-unblock for failed dependency %s -> %s (blocked_dependents=%d)",
+                self.agent_name,
+                failed_task_id,
+                recovery_id,
+                dependents,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=failed_task_id,
+                state="active",
+            )
+            return True
+        finally:
+            self.redis_store.release_lock(failed_task_id, self.agent_name)
+
+    def _existing_recovery_dependencies(self, task_id: str) -> list[str]:
+        """Return active remediation dependency task IDs for a task."""
+        dag = self.redis_store.read_dag(self.goal_id)
+        if not dag:
+            return []
+        recovery_deps: list[str] = []
+        for dep_id in dag.dependencies_for(task_id):
+            if not dep_id.startswith(f"{task_id}__recover_"):
+                continue
+            dep_state = self.redis_store.get_task_state(dep_id)
+            if not dep_state:
+                continue
+            if dep_state.status not in {TaskStatus.DONE, TaskStatus.FAILED}:
+                recovery_deps.append(dep_id)
+        return sorted(recovery_deps)
 
     def _emit_idle_heartbeat(self, *, reason: str, ready_count: int, eligible_count: int) -> None:
         """Emit periodic idle-state summary at INFO level."""

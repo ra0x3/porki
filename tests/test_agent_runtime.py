@@ -876,3 +876,62 @@ def test_startup_logs_stale_recovery_summary(redis_store, tmp_path, caplog):
 
     resume_logs = [rec for rec in caplog.records if "Startup recovered 1 stale task(s)" in rec.getMessage()]
     assert len(resume_logs) == 1
+
+
+def test_auto_unblocks_when_blocked_by_failed_dependency(redis_store, tmp_path, caplog):
+    """Runtime should create remediation work for failed prerequisites that block progress."""
+    goal_id = "goal-auto-unblock"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-failed",
+                title="Failed prerequisite",
+                priority=3,
+                metadata={"phase": "development", "required_role": "features-dev"},
+            ),
+            TaskNode(
+                id="task-blocked",
+                title="Downstream work",
+                priority=2,
+                metadata={"phase": "development", "required_role": "features-dev"},
+            ),
+        ],
+        edges=[TaskEdge(source="task-failed", target="task-blocked")],
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state(
+        "task-failed",
+        TaskState(status=TaskStatus.FAILED, last_error="compile error"),
+    )
+    redis_store.update_task_state("task-blocked", TaskState(status=TaskStatus.BLOCKED))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="features-dev",
+        agent_role="features-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=1)
+
+    dag_after = redis_store.read_dag(goal_id)
+    assert dag_after is not None
+    recovery_ids = sorted(node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_"))
+    assert len(recovery_ids) == 1
+
+    failed_state = redis_store.get_task_state("task-failed")
+    assert failed_state is not None
+    assert failed_state.status is TaskStatus.BLOCKED
+
+    triggered_logs = [rec for rec in caplog.records if "Auto-unblock for failed dependency task-failed" in rec.getMessage()]
+    assert len(triggered_logs) == 1
