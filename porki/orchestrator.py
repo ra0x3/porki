@@ -47,6 +47,7 @@ class SpawnAdapter:
         log_level: str,
         heartbeat_interval: float,
         instruction_interval: float,
+        idle_log_interval: float,
         llm_config: LLMRuntimeConfig,
     ) -> SpawnHandle:
         """Spawn one agent process and return a handle."""
@@ -69,6 +70,7 @@ class LoggingSpawnAdapter(SpawnAdapter, BaseLogger):
         log_level: str,
         heartbeat_interval: float,
         instruction_interval: float,
+        idle_log_interval: float,
         llm_config: LLMRuntimeConfig,
     ) -> SpawnHandle:
         """Build an agent command and log it without executing."""
@@ -106,6 +108,8 @@ class LoggingSpawnAdapter(SpawnAdapter, BaseLogger):
             str(float(heartbeat_interval)),
             "--instruction-interval",
             str(float(instruction_interval)),
+            "--idle-log-interval",
+            str(float(idle_log_interval)),
             *llm_config.cli_args(),
         ]
         self.logger.info("(dry-run) would spawn agent: %s", " ".join(command))
@@ -128,6 +132,7 @@ class RealSpawnAdapter(SpawnAdapter, BaseLogger):
         log_level: str,
         heartbeat_interval: float,
         instruction_interval: float,
+        idle_log_interval: float,
         llm_config: LLMRuntimeConfig,
     ) -> SpawnHandle:
         """Spawn agent process via `sysg spawn` and return handle."""
@@ -165,6 +170,8 @@ class RealSpawnAdapter(SpawnAdapter, BaseLogger):
             str(float(heartbeat_interval)),
             "--instruction-interval",
             str(float(instruction_interval)),
+            "--idle-log-interval",
+            str(float(idle_log_interval)),
             *llm_config.cli_args(),
         ]
         self.logger.info("Spawning agent: %s", " ".join(command))
@@ -212,6 +219,7 @@ class Orchestrator(BaseLogger):
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         heartbeat_interval: float = 300.0,
         instruction_interval: float = 300.0,
+        idle_log_interval: float = 60.0,
     ) -> None:
         """Initialize orchestrator dependencies and runtime state."""
         super().__init__(f"{self.__class__.__name__}")
@@ -226,6 +234,7 @@ class Orchestrator(BaseLogger):
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
         self.instruction_interval = instruction_interval
+        self.idle_log_interval = idle_log_interval
 
         self.parser = InstructionParser(instructions_path)
         self.instruction_store = InstructionStore(redis_store.client)
@@ -510,6 +519,7 @@ class Orchestrator(BaseLogger):
             log_level=descriptor.log_level,
             heartbeat_interval=self.heartbeat_interval,
             instruction_interval=self.instruction_interval,
+            idle_log_interval=self.idle_log_interval,
             llm_config=self.llm_config,
         )
         self.logger.info("Spawned agent %s with pid %s", descriptor.name, handle.pid)

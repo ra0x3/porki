@@ -52,6 +52,7 @@ class AgentRuntime(BaseLogger):
         lease_ttl: timedelta = DEFAULT_LEASE_TTL,
         heartbeat_refresh_interval: timedelta = HEARTBEAT_REFRESH_INTERVAL,
         instructions_refresh_interval: timedelta = INSTRUCTION_REFRESH_INTERVAL,
+        idle_log_interval: timedelta = timedelta(seconds=60),
     ) -> None:
         """Initialize agent runtime and restore persisted memory."""
         super().__init__(f"{self.__class__.__name__}[{agent_name}]")
@@ -68,6 +69,7 @@ class AgentRuntime(BaseLogger):
         self.lease_ttl = lease_ttl
         self.heartbeat_refresh_interval = heartbeat_refresh_interval
         self.instructions_refresh_interval = instructions_refresh_interval
+        self.idle_log_interval = idle_log_interval
 
         self.memory = Memory()
         self.instructions_text = ""
@@ -81,6 +83,7 @@ class AgentRuntime(BaseLogger):
         self._pid = os.getpid()
         self._last_queue_snapshot: tuple[int, int, tuple[tuple[str, int], ...]] | None = None
         self._last_goal_state_signature: str | None = None
+        self._last_idle_log: datetime = datetime.fromtimestamp(0, tz=timezone.utc)
 
         self._hydrate_memory()
         self.llm_client.set_spending_cap_callback(self._on_spending_cap)
@@ -225,6 +228,29 @@ class AgentRuntime(BaseLogger):
             self.agent_name, pid, capabilities={"role": self.agent_role}
         )
         self.reload_instructions()
+        recovered = self.redis_store.recover_stale_tasks(self.goal_id)
+        if recovered:
+            self.log_event(
+                logging.INFO,
+                "AGENT_RESUME_RECOVERY",
+                "[%s] Startup recovered %d stale task(s): %s",
+                self.agent_name,
+                len(recovered),
+                ", ".join(sorted(recovered)),
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="active",
+            )
+        else:
+            self.log_event(
+                logging.INFO,
+                "AGENT_RESUME_RECOVERY",
+                "[%s] Startup recovered 0 stale task(s)",
+                self.agent_name,
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="active",
+            )
         cycles = 0
         self.log_event(
             logging.INFO,
@@ -317,6 +343,7 @@ class AgentRuntime(BaseLogger):
         ready_role_counts = self._ready_role_counts(ready_task_ids)
         if not ready_task_ids:
             self._emit_goal_state(ready_task_ids, ready_role_counts, eligible_count=0)
+            self._emit_idle_heartbeat(reason="queue-empty", ready_count=0, eligible_count=0)
             if self._last_queue_snapshot != (0, 0, ()):
                 self.log_event(
                     logging.INFO,
@@ -371,6 +398,11 @@ class AgentRuntime(BaseLogger):
         self._emit_goal_state(ready_task_ids, ready_role_counts, eligible_count=len(ready_nodes))
 
         if not ready_nodes:
+            self._emit_idle_heartbeat(
+                reason="no-eligible-tasks",
+                ready_count=len(ready_task_ids),
+                eligible_count=0,
+            )
             if snapshot_changed:
                 self.log_event(
                     logging.INFO,
@@ -948,3 +980,34 @@ class AgentRuntime(BaseLogger):
         self._last_goal_state_signature = (
             f"active:{ready_count}:{eligible_count}:{blocked_count}:{running_count}"
         )
+
+    def _emit_idle_heartbeat(self, *, reason: str, ready_count: int, eligible_count: int) -> None:
+        """Emit periodic idle-state summary at INFO level."""
+        now = datetime.now(timezone.utc)
+        if (now - self._last_idle_log) < self.idle_log_interval:
+            return
+
+        counts = self.redis_store.goal_status_counts(self.goal_id)
+        running_count = counts.get(TaskStatus.RUNNING, 0) + counts.get(TaskStatus.CLAIMED, 0)
+        blocked_count = counts.get(TaskStatus.BLOCKED, 0)
+        done_count = counts.get(TaskStatus.DONE, 0)
+        failed_count = counts.get(TaskStatus.FAILED, 0)
+
+        self.log_event(
+            logging.INFO,
+            "IDLE_HEARTBEAT",
+            "[%s] Idle (%s) on goal %s: ready=%d eligible=%d running=%d blocked=%d done=%d failed=%d",
+            self.agent_name,
+            reason,
+            self.goal_id,
+            ready_count,
+            eligible_count,
+            running_count,
+            blocked_count,
+            done_count,
+            failed_count,
+            goal=self.goal_id,
+            role=self.agent_role,
+            state="idle",
+        )
+        self._last_idle_log = now

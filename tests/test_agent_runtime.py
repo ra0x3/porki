@@ -802,3 +802,77 @@ def test_no_eligible_log_is_deduplicated_for_unchanged_queue(redis_store, tmp_pa
         if "No eligible ready tasks for role qa-dev" in rec.getMessage()
     ]
     assert len(no_eligible_logs) == 1
+
+
+def test_idle_heartbeat_logs_periodically_when_still_idle(redis_store, tmp_path, caplog):
+    """Runtime should emit recurring idle summaries instead of going fully quiet."""
+    goal_id = "goal-idle-heartbeat"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-features",
+                title="Features work",
+                priority=1,
+                metadata={"phase": "development", "required_role": "features-dev"},
+            )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="qa-dev",
+        agent_role="qa-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+        idle_log_interval=timedelta(seconds=0),
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=3)
+
+    idle_logs = [rec for rec in caplog.records if "Idle (no-eligible-tasks)" in rec.getMessage()]
+    assert len(idle_logs) >= 3
+
+
+def test_startup_logs_stale_recovery_summary(redis_store, tmp_path, caplog):
+    """Runtime should report stale-task recovery status at startup."""
+    goal_id = "goal-startup-recovery-log"
+    redis_store.write_dag(_prepare_dag(goal_id))
+    redis_store.update_task_state(
+        "task-1",
+        TaskState(
+            status=TaskStatus.RUNNING,
+            owner="dead-agent",
+            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
+        ),
+    )
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("PAUSE\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="agent-research",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=1)
+
+    resume_logs = [rec for rec in caplog.records if "Startup recovered 1 stale task(s)" in rec.getMessage()]
+    assert len(resume_logs) == 1

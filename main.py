@@ -124,6 +124,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=300.0,
         help="Agent instructions reload interval in seconds",
     )
+    run_parser.add_argument(
+        "--idle-log-interval",
+        type=float,
+        default=60.0,
+        help="Agent idle-state summary log interval in seconds",
+    )
     _add_llm_flags(run_parser)
 
     instructions_parser = subparsers.add_parser("instructions", help="Instruction file utilities")
@@ -327,6 +333,7 @@ def _handle_run_command(args: argparse.Namespace, parser: argparse.ArgumentParse
             lease_ttl=timedelta(seconds=args.lease_ttl),
             heartbeat_refresh_interval=timedelta(seconds=args.heartbeat_interval),
             instructions_refresh_interval=timedelta(seconds=args.instruction_interval),
+            idle_log_interval=timedelta(seconds=args.idle_log_interval),
         )
         runtime.run()
         return 0
@@ -341,6 +348,7 @@ def _handle_run_command(args: argparse.Namespace, parser: argparse.ArgumentParse
         poll_interval=args.poll_interval,
         heartbeat_interval=args.heartbeat_interval,
         instruction_interval=args.instruction_interval,
+        idle_log_interval=args.idle_log_interval,
         llm_config=llm_config,
     )
     orchestrator.run()

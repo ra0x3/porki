@@ -21,6 +21,7 @@ class RecordingSpawner(SpawnAdapter):
         log_level: str,
         heartbeat_interval: float,
         instruction_interval: float,
+        idle_log_interval: float,
         llm_config,
     ) -> SpawnHandle:
         """Record spawn arguments and return fixed handle."""
@@ -34,6 +35,7 @@ class RecordingSpawner(SpawnAdapter):
                 log_level,
                 heartbeat_interval,
                 instruction_interval,
+                idle_log_interval,
                 llm_config.provider,
             )
         )
@@ -77,7 +79,7 @@ def test_orchestrator_creates_dag_and_spawns_agent(redis_store, assets_dir, tmp_
     assert stored_dag.goal_id == "goal-demo"
     assert {node.id for node in stored_dag.nodes} == {"task-1"}
     assert spawner.calls == [
-        ("agent-research", os.getpid(), "fakeredis://", "INFO", 300.0, 300.0, "claude")
+        ("agent-research", os.getpid(), "fakeredis://", "INFO", 300.0, 300.0, 60.0, "claude")
     ]
 
 
