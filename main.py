@@ -100,6 +100,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--redis-url", default="fakeredis://", help="Redis connection URL")
     run_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+    run_parser.add_argument("--color", action="store_true", help="Enable colored logging output")
     run_parser.add_argument("--agent-name", help="Agent identifier when running in agent mode")
     run_parser.add_argument("--agent-role", help="Agent role identifier when running in agent mode")
     run_parser.add_argument("--goal-id", help="Goal identifier for the active DAG")
@@ -127,6 +128,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     instructions_parser = subparsers.add_parser("instructions", help="Instruction file utilities")
     instructions_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+    instructions_parser.add_argument(
+        "--color", action="store_true", help="Enable colored logging output"
+    )
     instructions_subparsers = instructions_parser.add_subparsers(
         dest="instructions_command", required=True
     )
@@ -166,13 +170,20 @@ def _redis_client_from_url(url: str):
     return redis.Redis.from_url(url)
 
 
-def _configure_logging(level: str) -> None:
+def _configure_logging(level: str, use_color: bool = False) -> None:
     """Configure root logging format and level."""
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     stream = logging.StreamHandler()
-    stream.setFormatter(EventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    if use_color:
+        from porki.logging_utils import ColoredEventFormatter
+
+        stream.setFormatter(
+            ColoredEventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+    else:
+        stream.setFormatter(EventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     handler = CompactingHandler(stream)
     handler.addFilter(EventContextFilter())
     root.addHandler(handler)
@@ -340,7 +351,7 @@ def run_cli(argv: list[str] | None = None) -> int:
     """Execute CLI entrypoint logic and return process exit code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.log_level)
+    _configure_logging(args.log_level, use_color=getattr(args, "color", False))
 
     if args.command == "instructions":
         return _handle_instructions_command(args, parser)

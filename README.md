@@ -86,6 +86,18 @@ One-shot prompt mode:
 porki run --prompt "Draft a concise architecture summary for this repo."
 ```
 
+Enable colored logging output (similar to cargo):
+
+```bash
+porki run --role orchestrator --instructions INSTRUCTIONS.md --color
+```
+
+The `--color` flag enables ANSI color codes for log levels:
+- **INFO**: Green
+- **DEBUG**: Light Blue (Cyan)
+- **WARNING**: Yellow
+- **ERROR**: Red
+
 Create a template instruction file:
 
 ```bash
@@ -171,7 +183,7 @@ options:
 usage: porki run [-h] [--role {agent,orchestrator}]
                  [--instructions INSTRUCTIONS] [-p [PROMPT]]
                  [--redis-url REDIS_URL] [--log-level LOG_LEVEL]
-                 [--agent-name AGENT_NAME] [--agent-role AGENT_ROLE]
+                 [--color] [--agent-name AGENT_NAME] [--agent-role AGENT_ROLE]
                  [--goal-id GOAL_ID] [--heartbeat HEARTBEAT]
                  [--loop-interval LOOP_INTERVAL] [--lease-ttl LEASE_TTL]
                  [--poll-interval POLL_INTERVAL]
@@ -184,7 +196,7 @@ usage: porki run [-h] [--role {agent,orchestrator}]
 ```
 
 ```text
-usage: porki instructions [-h] [--log-level LOG_LEVEL] {create} ...
+usage: porki instructions [-h] [--log-level LOG_LEVEL] [--color] {create} ...
 ```
 
 ```text

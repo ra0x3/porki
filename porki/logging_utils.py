@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Final
 
+from porki.constants import COLOR_RESET, LOG_LEVEL_COLORS
+
 
 class EventContextFilter(logging.Filter):
     """Populate structured event fields so every log line is parseable."""
@@ -134,3 +136,21 @@ class CompactingHandler(logging.Handler):
             if key not in standard:
                 setattr(clone, key, value)
         return clone
+
+
+class ColoredEventFormatter(EventFormatter):
+    """Colored version of EventFormatter that applies ANSI colors based on log level."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format base message with color applied to log level."""
+        original_levelname = record.levelname
+
+        color = LOG_LEVEL_COLORS.get(record.levelno, "")
+        if color:
+            record.levelname = f"{color}{record.levelname}{COLOR_RESET}"
+
+        formatted = super().format(record)
+
+        record.levelname = original_levelname
+
+        return formatted
