@@ -1,7 +1,12 @@
 import logging
 from io import StringIO
 
-from porki.logging_utils import CompactingHandler, EventContextFilter, EventFormatter
+from porki.logging_utils import (
+    CompactingHandler,
+    ConciseEventFormatter,
+    EventContextFilter,
+    EventFormatter,
+)
 
 
 class _CaptureHandler(logging.Handler):
@@ -163,6 +168,50 @@ def test_event_formatter_emits_structured_suffix() -> None:
     rendered = formatter.format(record)
     assert rendered.endswith(
         "evt=TASK_DONE goal=orchestrator-ui role=qa-dev task=task-010__qa state=done next_retry=-"
+    )
+
+
+def test_concise_event_formatter_omits_default_context() -> None:
+    formatter = ConciseEventFormatter("%(levelname)s %(message)s")
+    record = logging.LogRecord(
+        name="x",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="line",
+        args=(),
+        exc_info=None,
+    )
+    record.evt = "GEN"
+    record.goal = "-"
+    record.role = "-"
+    record.task = "-"
+    record.state = "-"
+    record.next_retry = "-"
+    rendered = formatter.format(record)
+    assert rendered == "INFO line"
+
+
+def test_concise_event_formatter_renders_meaningful_context_only() -> None:
+    formatter = ConciseEventFormatter("%(levelname)s %(message)s")
+    record = logging.LogRecord(
+        name="x",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="line",
+        args=(),
+        exc_info=None,
+    )
+    record.evt = "TASK_DONE"
+    record.goal = "orchestrator-ui"
+    record.role = "qa-dev"
+    record.task = "task-010__qa"
+    record.state = "done"
+    record.next_retry = "-"
+    rendered = formatter.format(record)
+    assert rendered.endswith(
+        "evt=TASK_DONE role=qa-dev task=task-010__qa state=done goal=orchestrator-ui"
     )
 
 

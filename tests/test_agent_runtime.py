@@ -719,6 +719,44 @@ def test_goal_completion_logs_once_when_no_work_left(redis_store, tmp_path, capl
     assert len(completion_logs) == 1
 
 
+def test_goal_not_complete_when_failed_tasks_remain(redis_store, tmp_path, caplog):
+    """Runtime should not report completion when failed tasks remain."""
+    goal_id = "goal-incomplete-failures"
+    redis_store.write_dag(_prepare_dag(goal_id))
+    redis_store.update_task_state("task-1", TaskState(status=TaskStatus.FAILED, last_error="boom"))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="qa-dev",
+        agent_role="qa-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=1)
+
+    complete_logs = [
+        rec
+        for rec in caplog.records
+        if "Goal goal-incomplete-failures complete" in rec.getMessage()
+    ]
+    assert complete_logs == []
+    incomplete_logs = [
+        rec
+        for rec in caplog.records
+        if "Goal goal-incomplete-failures not complete" in rec.getMessage()
+    ]
+    assert len(incomplete_logs) == 1
+
+
 def test_logs_blocked_when_ready_tasks_require_inactive_roles(redis_store, tmp_path, caplog):
     """Runtime should explain goal-wide blockage when required roles are inactive."""
     goal_id = "goal-inactive-role"
@@ -986,6 +1024,51 @@ def test_non_coordinator_does_not_run_auto_unblock(redis_store, tmp_path):
         node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_")
     ]
     assert recovery_ids == []
+
+
+def test_coordinator_auto_unblocks_failed_dead_end(redis_store, tmp_path, caplog):
+    """Coordinator should create remediation for failed dead-end tasks when queue is empty."""
+    goal_id = "goal-auto-unblock-dead-end"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[TaskNode(id="task-failed", title="Failed leaf", priority=3)],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+    redis_store.update_task_state(
+        "task-failed", TaskState(status=TaskStatus.FAILED, last_error="boom")
+    )
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="owner",
+        agent_role="owner",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        agent.run(max_cycles=1)
+
+    dag_after = redis_store.read_dag(goal_id)
+    assert dag_after is not None
+    recovery_ids = sorted(
+        node.id for node in dag_after.nodes if node.id.startswith("task-failed__recover_")
+    )
+    assert len(recovery_ids) == 1
+    triggered_logs = [
+        rec
+        for rec in caplog.records
+        if "Auto-unblock for failed dependency task-failed" in rec.getMessage()
+    ]
+    assert len(triggered_logs) == 1
 
 
 def test_exhausted_auto_unblock_escalates_once(redis_store, tmp_path, caplog):

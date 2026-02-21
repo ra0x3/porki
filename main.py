@@ -100,6 +100,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--redis-url", default="fakeredis://", help="Redis connection URL")
     run_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+    run_parser.add_argument(
+        "--log-style",
+        choices=["concise", "event"],
+        default="concise",
+        help="Terminal log style: concise (default) or event (full context)",
+    )
     run_parser.add_argument("--color", action="store_true", help="Enable colored logging output")
     run_parser.add_argument("--agent-name", help="Agent identifier when running in agent mode")
     run_parser.add_argument("--agent-role", help="Agent role identifier when running in agent mode")
@@ -134,6 +140,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     instructions_parser = subparsers.add_parser("instructions", help="Instruction file utilities")
     instructions_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+    instructions_parser.add_argument(
+        "--log-style",
+        choices=["concise", "event"],
+        default="concise",
+        help="Terminal log style: concise (default) or event (full context)",
+    )
     instructions_parser.add_argument(
         "--color", action="store_true", help="Enable colored logging output"
     )
@@ -176,20 +188,27 @@ def _redis_client_from_url(url: str):
     return redis.Redis.from_url(url)
 
 
-def _configure_logging(level: str, use_color: bool = False) -> None:
+def _configure_logging(level: str, use_color: bool = False, log_style: str = "concise") -> None:
     """Configure root logging format and level."""
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     stream = logging.StreamHandler()
-    if use_color:
+    if use_color and log_style == "event":
         from porki.logging_utils import ColoredEventFormatter
 
-        stream.setFormatter(
-            ColoredEventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
+        formatter = ColoredEventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    elif use_color and log_style == "concise":
+        from porki.logging_utils import ColoredConciseEventFormatter
+
+        formatter = ColoredConciseEventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    elif log_style == "event":
+        formatter = EventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     else:
-        stream.setFormatter(EventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        from porki.logging_utils import ConciseEventFormatter
+
+        formatter = ConciseEventFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    stream.setFormatter(formatter)
     handler = CompactingHandler(stream)
     handler.addFilter(EventContextFilter())
     root.addHandler(handler)
@@ -359,7 +378,11 @@ def run_cli(argv: list[str] | None = None) -> int:
     """Execute CLI entrypoint logic and return process exit code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.log_level, use_color=getattr(args, "color", False))
+    _configure_logging(
+        args.log_level,
+        use_color=getattr(args, "color", False),
+        log_style=getattr(args, "log_style", "concise"),
+    )
 
     if args.command == "instructions":
         return _handle_instructions_command(args, parser)

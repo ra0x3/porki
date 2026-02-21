@@ -942,6 +942,24 @@ class AgentRuntime(BaseLogger):
         failed_count = counts.get(TaskStatus.FAILED, 0)
 
         if ready_count == 0 and running_count == 0 and blocked_count == 0:
+            if failed_count > 0:
+                signature = f"incomplete-failures:{failed_count}:{done_count}"
+                if signature != self._last_goal_state_signature:
+                    self.log_event(
+                        logging.WARNING,
+                        "GOAL_INCOMPLETE_FAILURES",
+                        "[%s] Goal %s not complete: 0 runnable tasks but %d failed task(s) remain (done=%d)",
+                        self.agent_name,
+                        self.goal_id,
+                        failed_count,
+                        done_count,
+                        goal=self.goal_id,
+                        role=self.agent_role,
+                        state="error",
+                    )
+                self._last_goal_state_signature = signature
+                return
+
             signature = f"complete:{done_count}:{failed_count}"
             if signature != self._last_goal_state_signature:
                 self.log_event(
@@ -986,7 +1004,7 @@ class AgentRuntime(BaseLogger):
         )
 
     def _attempt_auto_unblock_failed_dependencies(self) -> bool:
-        """Create recovery work when blocked tasks depend on failed prerequisites."""
+        """Create recovery work for failed tasks that currently deadlock progress."""
         if not self._is_auto_unblock_coordinator():
             return False
         if not self._acquire_auto_unblock_coordinator_slot():
@@ -1006,11 +1024,13 @@ class AgentRuntime(BaseLogger):
                 if dep_state and dep_state.status == TaskStatus.FAILED:
                     blocking_failed_ids.add(dep_id)
 
-        if not blocking_failed_ids:
+        failed_dead_ends = self._failed_tasks_without_active_recovery(dag)
+        candidate_failed_ids = blocking_failed_ids | failed_dead_ends
+        if not candidate_failed_ids:
             return False
 
         triggered = 0
-        for failed_id in sorted(blocking_failed_ids):
+        for failed_id in sorted(candidate_failed_ids):
             if self._recover_failed_dependency(dag, failed_id):
                 triggered += 1
 
@@ -1217,6 +1237,18 @@ class AgentRuntime(BaseLogger):
             if dep_state.status not in {TaskStatus.DONE, TaskStatus.FAILED}:
                 recovery_deps.append(dep_id)
         return sorted(recovery_deps)
+
+    def _failed_tasks_without_active_recovery(self, dag: DagModel) -> set[str]:
+        """Return failed tasks that currently have no active remediation dependencies."""
+        failed_ids: set[str] = set()
+        for node in dag.nodes:
+            state = self.redis_store.get_task_state(node.id)
+            if not state or state.status != TaskStatus.FAILED:
+                continue
+            if self._existing_recovery_dependencies(node.id):
+                continue
+            failed_ids.add(node.id)
+        return failed_ids
 
     def _emit_idle_heartbeat(self, *, reason: str, ready_count: int, eligible_count: int) -> None:
         """Emit periodic idle-state summary at INFO level."""

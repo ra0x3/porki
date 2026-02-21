@@ -40,6 +40,38 @@ class EventFormatter(logging.Formatter):
         return f"{base} | {suffix}"
 
 
+class ConciseEventFormatter(logging.Formatter):
+    """Human-first formatter that omits empty/default structured fields."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format message with compact optional context suffix."""
+        base = super().format(record)
+        evt = getattr(record, "evt", "GEN")
+        goal = getattr(record, "goal", "-")
+        role = getattr(record, "role", "-")
+        task = getattr(record, "task", "-")
+        state = getattr(record, "state", "-")
+        next_retry = getattr(record, "next_retry", "-")
+
+        parts: list[str] = []
+        if evt != "GEN":
+            parts.append(f"evt={evt}")
+        if role != "-":
+            parts.append(f"role={role}")
+        if task != "-":
+            parts.append(f"task={task}")
+        if state != "-":
+            parts.append(f"state={state}")
+        if goal != "-":
+            parts.append(f"goal={goal}")
+        if next_retry != "-":
+            parts.append(f"next={next_retry}")
+
+        if not parts:
+            return base
+        return f"{base} | {' '.join(parts)}"
+
+
 class CompactingHandler(logging.Handler):
     """Collapse consecutive duplicate log messages into one counted line."""
 
@@ -140,6 +172,24 @@ class CompactingHandler(logging.Handler):
 
 class ColoredEventFormatter(EventFormatter):
     """Colored version of EventFormatter that applies ANSI colors based on log level."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Format base message with color applied to log level."""
+        original_levelname = record.levelname
+
+        color = LOG_LEVEL_COLORS.get(record.levelno, "")
+        if color:
+            record.levelname = f"{color}{record.levelname}{COLOR_RESET}"
+
+        formatted = super().format(record)
+
+        record.levelname = original_levelname
+
+        return formatted
+
+
+class ColoredConciseEventFormatter(ConciseEventFormatter):
+    """Colored version of concise formatter for terminal readability."""
 
     def format(self, record: logging.LogRecord) -> str:
         """Format base message with color applied to log level."""

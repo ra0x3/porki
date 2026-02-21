@@ -19,6 +19,7 @@ def test_run_parser_defaults_for_refresh_intervals():
     assert args.heartbeat_interval == 300.0
     assert args.instruction_interval == 300.0
     assert args.idle_log_interval == 60.0
+    assert args.log_style == "concise"
 
 
 def test_run_parser_accepts_refresh_interval_overrides():
@@ -37,11 +38,14 @@ def test_run_parser_accepts_refresh_interval_overrides():
             "90",
             "--idle-log-interval",
             "15",
+            "--log-style",
+            "event",
         ]
     )
     assert args.heartbeat_interval == 45.0
     assert args.instruction_interval == 90.0
     assert args.idle_log_interval == 15.0
+    assert args.log_style == "event"
 
 
 def test_run_parser_accepts_direct_prompt():
