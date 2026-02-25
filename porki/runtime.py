@@ -37,6 +37,12 @@ class AgentRuntime(BaseLogger):
         re.compile(r"command not found|not found", re.IGNORECASE),
         re.compile(r"unsupported engine|requires node|node\\s+version", re.IGNORECASE),
     )
+    _ROLE_REASSIGN_PATTERNS = (
+        re.compile(r"\bbelongs to (?:the )?([a-z0-9-]+) role\b", re.IGNORECASE),
+        re.compile(r"\bshould be reassigned to (?:the )?([a-z0-9-]+) role\b", re.IGNORECASE),
+        re.compile(r"\breassign(?:ed)? to (?:the )?([a-z0-9-]+) role\b", re.IGNORECASE),
+        re.compile(r"\bbelongs to (?:the )?([a-z0-9-]+)\b", re.IGNORECASE),
+    )
 
     def __init__(
         self,
@@ -458,6 +464,7 @@ class AgentRuntime(BaseLogger):
                 role=self.agent_role,
                 state="idle",
             )
+            self._maybe_reassign_declined_task(ready_nodes, selection.justification)
             return
 
         self.log_event(
@@ -895,6 +902,87 @@ class AgentRuntime(BaseLogger):
         root_id = node.metadata.get("recovery_for") or node.id
         root_node = self.redis_store.get_task_node(self.goal_id, root_id)
         return root_node or node
+
+    def _maybe_reassign_declined_task(
+        self, ready_nodes: list[TaskNode], justification: str
+    ) -> bool:
+        """Reassign a single ready task when selection decline explicitly identifies a role mismatch."""
+        if len(ready_nodes) != 1:
+            return False
+
+        target_role = self._extract_role_reassignment_target(justification)
+        if not target_role:
+            return False
+
+        node = self.redis_store.get_task_node(self.goal_id, ready_nodes[0].id)
+        if not node:
+            return False
+        current_role = node.metadata.get("required_role")
+        if not current_role or current_role == target_role:
+            return False
+
+        # Avoid mutating work another agent is concurrently processing.
+        if not self.redis_store.acquire_lock(node.id, self.agent_name, self.lease_ttl):
+            return False
+
+        try:
+            state = self.redis_store.get_task_state(node.id)
+            if not state or state.status is not TaskStatus.READY:
+                return False
+
+            node = self.redis_store.get_task_node(self.goal_id, node.id) or node
+            current_role = node.metadata.get("required_role")
+            if not current_role or current_role == target_role:
+                return False
+
+            node.metadata["required_role"] = target_role
+            if node.metadata.get("phase", "development") == "development" and node.metadata.get(
+                "dev_role"
+            ) in {None, current_role}:
+                node.metadata["dev_role"] = target_role
+            self.redis_store.update_task_node(self.goal_id, node)
+
+            self.log_event(
+                logging.WARNING,
+                "TASK_REASSIGNED_ROLE_MISMATCH",
+                "[%s] Reassigned task %s from role %s to %s after selection decline",
+                self.agent_name,
+                node.id,
+                current_role,
+                target_role,
+                goal=self.goal_id,
+                role=self.agent_role,
+                task=node.id,
+                state="active",
+            )
+            self.memory.append(
+                f"Reassigned {node.id} role {current_role} -> {target_role} after selection decline"
+            )
+            self.redis_store.store_memory_snapshot(self.agent_name, self.memory.snapshot())
+            return True
+        finally:
+            self.redis_store.release_lock(node.id, self.agent_name)
+
+    def _extract_role_reassignment_target(self, justification: str) -> str | None:
+        """Parse a target role from an explicit role-mismatch decline justification."""
+        text = (justification or "").strip().lower()
+        if not text:
+            return None
+        if "role" not in text and "belongs to" not in text:
+            return None
+        if self.agent_role.lower() not in text and "not " not in text:
+            return None
+        for pattern in self._ROLE_REASSIGN_PATTERNS:
+            match = pattern.search(text)
+            if not match:
+                continue
+            candidate = match.group(1).strip().lower()
+            if not re.fullmatch(r"[a-z][a-z0-9-]*", candidate):
+                continue
+            if candidate == self.agent_role.lower():
+                continue
+            return candidate
+        return None
 
     @staticmethod
     def _error_signature(error: str) -> str:

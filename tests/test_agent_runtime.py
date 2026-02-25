@@ -123,6 +123,23 @@ class NoSelectLLM(StubLLMClient):
         raise AssertionError("select_next_task should not run during spending-cap backoff")
 
 
+class DeclineSelectionLLM(StubLLMClient):
+    """Return a deterministic selection decline for role-mismatch tests."""
+
+    def __init__(self, justification: str):
+        super().__init__()
+        self.justification = justification
+
+    def select_next_task(
+        self, ready_nodes, *, memory, goal_id: str, instructions: str
+    ) -> TaskSelection:
+        return TaskSelection(
+            selected_task_id=None,
+            justification=self.justification,
+            confidence=1.0,
+        )
+
+
 class CountingHeartbeatRuntime(AgentRuntime):
     """Runtime test helper to count heartbeat file reads."""
 
@@ -283,6 +300,102 @@ def test_role_restriction_blocks_wrong_agent(redis_store, tmp_path):
     state = redis_store.get_task_state("task-dev")
     assert state is not None
     assert state.status is TaskStatus.READY
+
+
+def test_selection_decline_reassigns_explicit_role_mismatch(redis_store, tmp_path):
+    """Selection-time role mismatch decline should reassign the single ready task."""
+    goal_id = "goal-role-reassign"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-004",
+                title="Build Dashboard Component",
+                priority=1,
+                metadata={
+                    "phase": "development",
+                    "required_role": "core-infra-dev",
+                    "dev_role": "core-infra-dev",
+                },
+            )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    llm = DeclineSelectionLLM(
+        "Task-004 requires creating UI components which belongs to ui-dev role, "
+        "not core-infra-dev. As core-infra-dev, I must reject this task."
+    )
+    agent = AgentRuntime(
+        agent_name="core-infra-dev",
+        agent_role="core-infra-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=llm,
+        loop_interval=0,
+    )
+
+    agent.run(max_cycles=1)
+
+    node = redis_store.get_task_node(goal_id, "task-004")
+    assert node is not None
+    assert node.metadata["required_role"] == "ui-dev"
+    assert node.metadata["dev_role"] == "ui-dev"
+
+    state = redis_store.get_task_state("task-004")
+    assert state is not None
+    assert state.status is TaskStatus.READY
+
+
+def test_selection_decline_without_role_hint_does_not_reassign(redis_store, tmp_path):
+    """Generic selection decline should not mutate task role assignment."""
+    goal_id = "goal-no-role-reassign"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-004",
+                title="Build Dashboard Component",
+                priority=1,
+                metadata={
+                    "phase": "development",
+                    "required_role": "core-infra-dev",
+                    "dev_role": "core-infra-dev",
+                },
+            )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    agent = AgentRuntime(
+        agent_name="core-infra-dev",
+        agent_role="core-infra-dev",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=DeclineSelectionLLM("No task is safe to select right now."),
+        loop_interval=0,
+    )
+
+    agent.run(max_cycles=1)
+
+    node = redis_store.get_task_node(goal_id, "task-004")
+    assert node is not None
+    assert node.metadata["required_role"] == "core-infra-dev"
+    assert node.metadata["dev_role"] == "core-infra-dev"
 
 
 def test_iterative_qa_loop_creates_remediation(redis_store, tmp_path):
