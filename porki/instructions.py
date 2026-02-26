@@ -1,56 +1,58 @@
-"""Instruction parsing utilities."""
+"""Instruction parsing utilities (strict YAML control-plane format)."""
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import yaml
 
 from .models import AgentDescriptor
 
+INSTRUCTION_SCHEMA_VERSION = "2"
+
 
 class InstructionParser:
-    """Parses orchestrator markdown/YAML instruction files into descriptors."""
+    """Parses orchestrator instruction YAML into agent descriptors."""
 
     def __init__(self, instructions_path: Path):
         """Bind parser to an instructions source path."""
         self.instructions_path = instructions_path
 
     def get_instructions(self) -> str:
-        """Read the markdown instructions file and return its contents."""
+        """Read the instruction file and return its contents."""
         if not self.instructions_path.exists():
             return ""
         return self.instructions_path.read_text(encoding="utf-8")
 
     def parse_agents(self) -> list[AgentDescriptor]:
-        """Extract agent configurations from YAML code blocks in markdown."""
+        """Extract agent configurations from a strict YAML instruction document."""
         if not self.instructions_path.exists():
             return []
 
         raw_text = self.instructions_path.read_text(encoding="utf-8")
+        if "```" in raw_text:
+            raise ValueError(
+                "Instruction files must be strict YAML documents; markdown code blocks are unsupported"
+            )
+        try:
+            data = yaml.safe_load(raw_text) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML instructions document: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Instructions must be a YAML mapping with top-level keys")
 
-        yaml_pattern = r"```ya?ml\s*\n(.*?)\n```"
-        matches = re.findall(yaml_pattern, raw_text, re.DOTALL)
-
-        if not matches:
-            try:
-                data = yaml.safe_load(raw_text) or []
-            except yaml.YAMLError as exc:
-                raise ValueError(
-                    f"No YAML code blocks found and content is not valid YAML: {exc}"
-                ) from exc
-        else:
-            try:
-                data = yaml.safe_load(matches[0]) or []
-            except yaml.YAMLError as exc:
-                raise ValueError(f"Invalid YAML in code block: {exc}") from exc
+        schema_version = str(data.get("instruction_schema_version", "")).strip()
+        if schema_version != INSTRUCTION_SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported or missing instruction_schema_version; "
+                f"expected {INSTRUCTION_SCHEMA_VERSION}"
+            )
 
         records = data
         if isinstance(data, dict):
             records = data.get("agents", [])
         if not isinstance(records, list):
-            raise ValueError("Instructions must contain a list of agents")
+            raise ValueError("Instructions must contain an 'agents' list")
 
         base_dir = self.instructions_path.parent
         descriptors: list[AgentDescriptor] = []

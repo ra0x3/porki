@@ -876,12 +876,16 @@ def test_logs_blocked_when_ready_tasks_require_inactive_roles(redis_store, tmp_p
     dag = DagModel(
         goal_id=goal_id,
         nodes=[
-            TaskNode(
-                id="task-owner-only",
-                title="Owner work",
-                priority=1,
-                metadata={"phase": "integration", "required_role": "owner"},
-            )
+                TaskNode(
+                    id="task-owner-only",
+                    title="Owner work",
+                    priority=1,
+                    metadata={
+                        "phase": "integration",
+                        "required_role": "owner",
+                        "role_assignment": "hard",
+                    },
+                )
         ],
         edges=[],
     )
@@ -910,6 +914,188 @@ def test_logs_blocked_when_ready_tasks_require_inactive_roles(redis_store, tmp_p
     ]
     assert blocked_logs
     assert "inactive roles owner" in blocked_logs[0].getMessage()
+
+
+def test_coordinator_reassigns_soft_ready_task_from_inactive_builder_role(
+    redis_store, tmp_path, caplog
+):
+    """Owner/team-lead should deterministically reassign soft builder work when blocked."""
+    goal_id = "goal-soft-role-reassign"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+                TaskNode(
+                    id="task-features",
+                    title="Feature task",
+                    priority=1,
+                    metadata={
+                        "phase": "development",
+                        "required_role": "features-dev",
+                        "role_assignment": "soft",
+                    },
+                )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+    redis_store.register_agent("ui-dev-worker", pid=11, capabilities={"role": "ui-dev"})
+    redis_store.heartbeat_agent("ui-dev-worker", ttl=timedelta(seconds=30))
+    redis_store.register_agent("qa-worker", pid=12, capabilities={"role": "qa-dev"})
+    redis_store.heartbeat_agent("qa-worker", ttl=timedelta(seconds=30))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    coordinator = AgentRuntime(
+        agent_name="owner",
+        agent_role="owner",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        coordinator.run(max_cycles=1)
+
+    node = redis_store.get_task_node(goal_id, "task-features")
+    assert node is not None
+    assert node.metadata["required_role"] == "ui-dev"
+    assert node.metadata["original_required_role"] == "features-dev"
+    assert node.metadata["last_role_reassignment_reason"] == "inactive-required-role"
+
+    remediation_logs = [
+        rec
+        for rec in caplog.records
+        if "Remediated inactive-role stall by reassigning 1 ready task(s)" in rec.getMessage()
+    ]
+    assert len(remediation_logs) == 1
+
+
+def test_coordinator_remediates_orchestrator_style_inactive_builder_deadlock(
+    redis_store, tmp_path, caplog
+):
+    """Coordinator should reassign multiple ready builder tasks when only inactive builder roles own them."""
+    goal_id = "goal-orchestrator-ui-deadlock"
+    nodes = [
+        TaskNode(
+            id=f"task-core-{idx}",
+            title=f"Core task {idx}",
+            priority=10 - idx,
+            metadata={
+                "phase": "development",
+                "required_role": "core-infra-dev",
+                "role_assignment": "soft",
+            },
+        )
+        for idx in range(1, 4)
+    ] + [
+        TaskNode(
+            id=f"task-feat-{idx}",
+            title=f"Feature task {idx}",
+            priority=7 - idx,
+            metadata={
+                "phase": "development",
+                "required_role": "features-dev",
+                "role_assignment": "soft",
+            },
+        )
+        for idx in range(1, 4)
+    ]
+    dag = DagModel(goal_id=goal_id, nodes=nodes, edges=[])
+    redis_store.write_dag(dag)
+
+    # Active roles mirror the stalled example: no core-infra-dev / features-dev.
+    for pid, (agent_name, role) in enumerate(
+        [
+            ("owner-1", "owner"),
+            ("lead-1", "team-lead"),
+            ("ui-1", "ui-dev"),
+            ("qa-1", "qa-dev"),
+        ],
+        start=30,
+    ):
+        redis_store.register_agent(agent_name, pid=pid, capabilities={"role": role})
+        redis_store.heartbeat_agent(agent_name, ttl=timedelta(seconds=30))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    coordinator = AgentRuntime(
+        agent_name="owner",
+        agent_role="owner",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    with caplog.at_level(logging.INFO):
+        coordinator.run(max_cycles=1)
+
+    reassigned_to_ui = 0
+    for node_id in [f"task-core-{i}" for i in range(1, 4)] + [f"task-feat-{i}" for i in range(1, 4)]:
+        node = redis_store.get_task_node(goal_id, node_id)
+        assert node is not None
+        assert node.metadata["role_assignment"] == "soft"
+        assert node.metadata["required_role"] == "ui-dev"
+        assert node.metadata["original_required_role"] in {"core-infra-dev", "features-dev"}
+        reassigned_to_ui += 1
+    assert reassigned_to_ui == 6
+
+    remediation_logs = [
+        rec
+        for rec in caplog.records
+        if "Remediated inactive-role stall by reassigning 6 ready task(s)" in rec.getMessage()
+    ]
+    assert len(remediation_logs) == 1
+
+
+def test_coordinator_does_not_reassign_hard_integration_task(redis_store, tmp_path):
+    """Integration tasks remain hard-pinned even when the required role is inactive."""
+    goal_id = "goal-hard-role-remains"
+    dag = DagModel(
+        goal_id=goal_id,
+        nodes=[
+            TaskNode(
+                id="task-integrate",
+                title="Integration step",
+                priority=1,
+                metadata={"phase": "integration", "required_role": "owner"},
+            )
+        ],
+        edges=[],
+    )
+    redis_store.write_dag(dag)
+    redis_store.register_agent("ui-dev-worker", pid=21, capabilities={"role": "ui-dev"})
+    redis_store.heartbeat_agent("ui-dev-worker", ttl=timedelta(seconds=30))
+
+    instructions_path = tmp_path / "instructions.md"
+    heartbeat_path = tmp_path / "heartbeat.md"
+    instructions_path.write_text("test", encoding="utf-8")
+    heartbeat_path.write_text("RESUME\n", encoding="utf-8")
+
+    coordinator = AgentRuntime(
+        agent_name="team-lead",
+        agent_role="team-lead",
+        goal_id=goal_id,
+        instructions_path=instructions_path,
+        heartbeat_path=heartbeat_path,
+        redis_store=redis_store,
+        llm_client=StubLLMClient(),
+        loop_interval=0,
+    )
+    coordinator.run(max_cycles=1)
+
+    node = redis_store.get_task_node(goal_id, "task-integrate")
+    assert node is not None
+    assert node.metadata["required_role"] == "owner"
 
 
 def test_no_eligible_log_is_deduplicated_for_unchanged_queue(redis_store, tmp_path, caplog):

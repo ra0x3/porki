@@ -19,6 +19,7 @@ except ImportError:
     fakeredis = None
 
 from porki.cache import RedisStore
+from porki.instructions import InstructionParser
 from porki.instruction_schemas import (
     INSTRUCTION_SCHEMA_VERSION,
     INSTRUCTION_TEMPLATE_VERSION,
@@ -176,6 +177,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     create_parser.add_argument("--log-level", default="INFO", help="Python logging level")
 
+    validate_parser = instructions_subparsers.add_parser(
+        "validate",
+        help="Validate a strict YAML orchestrator instruction file",
+    )
+    validate_parser.add_argument(
+        "--path",
+        type=Path,
+        required=True,
+        help="Instruction YAML file to validate",
+    )
+    validate_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+
     return parser
 
 
@@ -296,6 +309,17 @@ List what must exist before this role starts.
 
 def _handle_instructions_command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Handle `porki instructions` subcommands."""
+    if args.instructions_command == "validate":
+        parser_obj = InstructionParser(args.path.expanduser().resolve())
+        agents = parser_obj.parse_agents()
+        LOGGER.info(
+            "Validated instruction file %s (schema v2, agents=%d)",
+            parser_obj.instructions_path,
+            len(agents),
+        )
+        print(f"valid: {parser_obj.instructions_path} agents={len(agents)}")
+        return 0
+
     if args.instructions_command != "create":
         parser.error(f"Unsupported instructions command: {args.instructions_command}")
 
@@ -354,7 +378,11 @@ def _handle_run_command(args: argparse.Namespace, parser: argparse.ArgumentParse
             instructions_refresh_interval=timedelta(seconds=args.instruction_interval),
             idle_log_interval=timedelta(seconds=args.idle_log_interval),
         )
-        runtime.run()
+        try:
+            runtime.run()
+        except KeyboardInterrupt:
+            LOGGER.info("Shutdown requested (Ctrl+C). Stopping gracefully...")
+            runtime.stop()
         return 0
 
     llm_client = create_llm_client(llm_config, redis_url=args.redis_url)
@@ -370,7 +398,11 @@ def _handle_run_command(args: argparse.Namespace, parser: argparse.ArgumentParse
         idle_log_interval=args.idle_log_interval,
         llm_config=llm_config,
     )
-    orchestrator.run()
+    try:
+        orchestrator.run()
+    except KeyboardInterrupt:
+        LOGGER.info("Shutdown requested (Ctrl+C). Stopping gracefully...")
+        orchestrator.stop()
     return 0
 
 

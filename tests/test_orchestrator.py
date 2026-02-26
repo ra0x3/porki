@@ -1,6 +1,8 @@
 import os
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from porki.llm import StubLLMClient
 from porki.models import DagModel, TaskNode, TaskState, TaskStatus
 from porki.orchestrator import Orchestrator, RealSpawnAdapter, SpawnAdapter, SpawnHandle
@@ -87,7 +89,7 @@ def test_orchestrator_applies_role_workflow(redis_store, tmp_path):
     """Orchestrator should add QA and integration workflow nodes."""
     instructions_path = tmp_path / "INSTRUCTIONS.md"
     instructions_path.write_text(
-        """```yaml
+        """instruction_schema_version: "2"
 agents:
   - name: team-lead
     role: team-lead
@@ -104,7 +106,7 @@ agents:
     goal: goal-demo
     heartbeat: instructions/heartbeat/QA_DEV.md
     instructions: instructions/QA_DEV.md
-```""",
+""",
         encoding="utf-8",
     )
     (tmp_path / "instructions" / "heartbeat").mkdir(parents=True)
@@ -148,20 +150,24 @@ agents:
     assert stored is not None
     node_ids = {node.id for node in stored.nodes}
     assert node_ids == {"task-1", "task-1__qa", "task-1__integrate"}
+    by_id = {node.id: node for node in stored.nodes}
+    assert by_id["task-1"].metadata["role_assignment"] == "soft"
+    assert by_id["task-1__qa"].metadata["role_assignment"] == "hard"
+    assert by_id["task-1__integrate"].metadata["role_assignment"] == "hard"
 
 
 def test_orchestrator_start_recovers_stale_tasks(redis_store, tmp_path):
     """Orchestrator startup should recover stale running tasks and report resume state."""
     instructions_path = tmp_path / "INSTRUCTIONS.md"
     instructions_path.write_text(
-        """```yaml
+        """instruction_schema_version: "2"
 agents:
   - name: agent-research
     role: agent-research
     goal: goal-demo
     heartbeat: instructions/heartbeat/agent-research.md
     instructions: instructions/agent-research.md
-```""",
+""",
         encoding="utf-8",
     )
     (tmp_path / "instructions" / "heartbeat").mkdir(parents=True)
@@ -202,7 +208,7 @@ def test_orchestrator_spawns_owner_team_lead_then_workers(redis_store, tmp_path)
     """Orchestrator should wire parent PID chain as owner->lead->workers."""
     instructions_path = tmp_path / "INSTRUCTIONS.md"
     instructions_path.write_text(
-        """```yaml
+        """instruction_schema_version: "2"
 agents:
   - name: owner
     role: owner
@@ -224,7 +230,7 @@ agents:
     goal: goal-demo
     heartbeat: instructions/heartbeat/WORKER_B.md
     instructions: instructions/WORKER_B.md
-```""",
+""",
         encoding="utf-8",
     )
     (tmp_path / "instructions" / "heartbeat").mkdir(parents=True)
@@ -265,3 +271,47 @@ agents:
 def test_real_spawn_adapter_parses_plain_pid_output():
     """Real spawn adapter should accept plain numeric sysg output."""
     assert RealSpawnAdapter._extract_spawned_pid("89310\n") == 89310
+
+
+def test_orchestrator_rejects_dag_missing_role_assignment_policy(redis_store, tmp_path):
+    """Orchestrator DAG validation should fail if role policy metadata is missing."""
+    instructions_path = tmp_path / "INSTRUCTIONS.yaml"
+    instructions_path.write_text(
+        """instruction_schema_version: "2"
+agents:
+  - name: agent-research
+    goal: goal-demo
+    heartbeat: instructions/heartbeat/agent-research.md
+    instructions: instructions/agent-research.md
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "instructions" / "heartbeat").mkdir(parents=True)
+    (tmp_path / "instructions" / "heartbeat" / "agent-research.md").write_text(
+        "RESUME\n", encoding="utf-8"
+    )
+    (tmp_path / "instructions" / "agent-research.md").write_text("test", encoding="utf-8")
+
+    orchestrator = Orchestrator(
+        instructions_path=instructions_path,
+        redis_store=redis_store,
+        redis_url="fakeredis://",
+        llm_client=StubLLMClient(
+            DagModel(
+                goal_id="goal-demo",
+                nodes=[TaskNode(id="task-1", title="Step 1", priority=1)],
+                edges=[],
+            )
+        ),
+        spawn_adapter=RecordingSpawner(),
+        poll_interval=0,
+    )
+
+    with pytest.raises(ValueError, match="role_assignment"):
+        orchestrator._validate_dag(
+            DagModel(
+                goal_id="goal-demo",
+                nodes=[TaskNode(id="task-x", title="X", priority=1, metadata={})],
+                edges=[],
+            )
+        )

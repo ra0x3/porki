@@ -245,11 +245,17 @@ class Orchestrator(BaseLogger):
     def run(self, *, max_cycles: int | None = None) -> None:
         """Run orchestration loop."""
         cycles = 0
-        while self._active and (max_cycles is None or cycles < max_cycles):
-            self._process_cycle()
-            cycles += 1
-            if self.poll_interval > 0:
-                time.sleep(self.poll_interval)
+        try:
+            while self._active and (max_cycles is None or cycles < max_cycles):
+                self._process_cycle()
+                cycles += 1
+                if self.poll_interval > 0:
+                    time.sleep(self.poll_interval)
+        except KeyboardInterrupt:
+            self.logger.info(
+                "Shutdown requested (Ctrl+C); stopping orchestrator gracefully"
+            )
+            self.stop()
 
     def stop(self) -> None:
         """Request orchestrator shutdown."""
@@ -370,6 +376,7 @@ class Orchestrator(BaseLogger):
             metadata.setdefault("phase", "development")
             metadata.setdefault("review_cycle", "0")
             metadata.setdefault("required_role", builder_roles[index % len(builder_roles)])
+            metadata.setdefault("role_assignment", "soft")
             metadata.setdefault("dev_role", metadata["required_role"])
             if lead_role:
                 metadata.setdefault("manager_role", lead_role)
@@ -392,6 +399,7 @@ class Orchestrator(BaseLogger):
                     metadata={
                         "phase": "qa",
                         "required_role": qa_role,
+                        "role_assignment": "hard",
                         "parent_task_id": node.id,
                         "review_cycle": "0",
                         "dev_role": metadata["dev_role"],
@@ -412,6 +420,7 @@ class Orchestrator(BaseLogger):
                     metadata={
                         "phase": "integration",
                         "required_role": lead_role,
+                        "role_assignment": "hard",
                         "parent_task_id": node.id,
                         "manager_role": lead_role,
                     },
@@ -541,6 +550,12 @@ class Orchestrator(BaseLogger):
     def _validate_dag(self, dag: DagModel) -> None:
         """Validate edge integrity and acyclic structure."""
         node_ids = {node.id for node in dag.nodes}
+        for node in dag.nodes:
+            role_assignment = str(node.metadata.get("role_assignment", "")).strip().lower()
+            if role_assignment not in {"hard", "soft"}:
+                raise ValueError(
+                    f"Task {node.id} missing/invalid role_assignment (expected 'hard' or 'soft')"
+                )
         for edge in dag.edges:
             if edge.source not in node_ids or edge.target not in node_ids:
                 raise ValueError(f"Invalid edge {edge.source}->{edge.target}")

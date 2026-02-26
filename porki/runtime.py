@@ -17,6 +17,7 @@ from .heartbeat import HeartbeatController, HeartbeatDirective
 from .llm import LLMClient, RecoveryDecision, TaskExecutionResult
 from .memory import Memory
 from .models import DEFAULT_LEASE_TTL, DagModel, TaskNode, TaskState, TaskStatus
+from .scheduler_policy import candidate_fallback_roles, role_assignment_is_hard
 from .version import BaseLogger, InstructionStore
 
 
@@ -270,56 +271,71 @@ class AgentRuntime(BaseLogger):
             state="active",
         )
 
-        while self._active and (max_cycles is None or cycles < max_cycles):
-            now = datetime.now(timezone.utc)
-            if now - self._last_heartbeat_poll >= self.heartbeat_refresh_interval:
-                directives = self.poll_heartbeat()
-                self.apply_directives(directives)
-                self._last_heartbeat_poll = now
-            self.heartbeat()
+        try:
+            while self._active and (max_cycles is None or cycles < max_cycles):
+                now = datetime.now(timezone.utc)
+                if now - self._last_heartbeat_poll >= self.heartbeat_refresh_interval:
+                    directives = self.poll_heartbeat()
+                    self.apply_directives(directives)
+                    self._last_heartbeat_poll = now
+                self.heartbeat()
 
-            cap_until = self.redis_store.get_goal_spending_cap_until(self.goal_id)
-            in_cap_backoff = bool(cap_until and cap_until > now)
-            if in_cap_backoff and not self._in_spending_cap_backoff:
-                wait_seconds = (cap_until - now).total_seconds() if cap_until else 0
-                self.log_event(
-                    logging.WARNING,
-                    "BACKOFF_ACTIVE",
-                    "[%s] Goal %s under spending-cap backoff for %.0fs (until %s); skipping work",
-                    self.agent_name,
-                    self.goal_id,
-                    max(0, wait_seconds),
-                    cap_until.isoformat(timespec="seconds") if cap_until else "unknown",
-                    goal=self.goal_id,
-                    role=self.agent_role,
-                    state="backoff",
-                    next_retry=cap_until.isoformat(timespec="seconds") if cap_until else "unknown",
-                )
-            elif not in_cap_backoff and self._in_spending_cap_backoff:
-                self.log_event(
-                    logging.INFO,
-                    "BACKOFF_CLEARED",
-                    "[%s] Goal %s spending-cap backoff cleared; resuming work",
-                    self.agent_name,
-                    self.goal_id,
-                    goal=self.goal_id,
-                    role=self.agent_role,
-                    state="active",
-                )
-            self._in_spending_cap_backoff = in_cap_backoff
+                cap_until = self.redis_store.get_goal_spending_cap_until(self.goal_id)
+                in_cap_backoff = bool(cap_until and cap_until > now)
+                if in_cap_backoff and not self._in_spending_cap_backoff:
+                    wait_seconds = (cap_until - now).total_seconds() if cap_until else 0
+                    self.log_event(
+                        logging.WARNING,
+                        "BACKOFF_ACTIVE",
+                        "[%s] Goal %s under spending-cap backoff for %.0fs (until %s); skipping work",
+                        self.agent_name,
+                        self.goal_id,
+                        max(0, wait_seconds),
+                        cap_until.isoformat(timespec="seconds") if cap_until else "unknown",
+                        goal=self.goal_id,
+                        role=self.agent_role,
+                        state="backoff",
+                        next_retry=(
+                            cap_until.isoformat(timespec="seconds")
+                            if cap_until
+                            else "unknown"
+                        ),
+                    )
+                elif not in_cap_backoff and self._in_spending_cap_backoff:
+                    self.log_event(
+                        logging.INFO,
+                        "BACKOFF_CLEARED",
+                        "[%s] Goal %s spending-cap backoff cleared; resuming work",
+                        self.agent_name,
+                        self.goal_id,
+                        goal=self.goal_id,
+                        role=self.agent_role,
+                        state="active",
+                    )
+                self._in_spending_cap_backoff = in_cap_backoff
 
-            if not self._paused and not in_cap_backoff:
-                if now - self._last_reload >= self.instructions_refresh_interval:
-                    self.reload_instructions()
-                self._run_cycle()
-            else:
-                if self._paused:
+                if not self._paused and not in_cap_backoff:
+                    if now - self._last_reload >= self.instructions_refresh_interval:
+                        self.reload_instructions()
+                    self._run_cycle()
+                elif self._paused:
                     self.logger.debug(
                         "[%s] Agent paused, skipping cycle %d", self.agent_name, cycles
                     )
-            cycles += 1
-            if self.loop_interval > 0:
-                time.sleep(self.loop_interval)
+                cycles += 1
+                if self.loop_interval > 0:
+                    time.sleep(self.loop_interval)
+        except KeyboardInterrupt:
+            self.log_event(
+                logging.INFO,
+                "AGENT_INTERRUPT",
+                "[%s] Shutdown requested (Ctrl+C); stopping gracefully",
+                self.agent_name,
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="stopping",
+            )
+            self.stop()
 
         self.log_event(
             logging.INFO,
@@ -408,6 +424,9 @@ class AgentRuntime(BaseLogger):
         self._emit_goal_state(ready_task_ids, ready_role_counts, eligible_count=len(ready_nodes))
 
         if not ready_nodes:
+            if self._attempt_auto_reassign_inactive_ready_tasks(ready_task_ids):
+                self._last_queue_snapshot = None
+                return
             self._emit_idle_heartbeat(
                 reason="no-eligible-tasks",
                 ready_count=len(ready_task_ids),
@@ -990,6 +1009,117 @@ class AgentRuntime(BaseLogger):
         normalized = re.sub(r"\s+", " ", error.lower()).strip()
         normalized = re.sub(r"\d+", "#", normalized)
         return normalized[:180]
+
+    def _role_assignment_is_hard(self, node: TaskNode) -> bool:
+        """Return whether role assignment should be treated as a hard constraint."""
+        try:
+            return role_assignment_is_hard(node)
+        except ValueError:
+            # Fail closed: unknown policy metadata is treated as non-reassignable.
+            return True
+
+    def _candidate_fallback_roles(self, node: TaskNode, active_roles: set[str]) -> list[str]:
+        """Return deterministic fallback roles that may execute the task."""
+        try:
+            return candidate_fallback_roles(
+                node=node,
+                active_roles=active_roles,
+                current_runtime_role=self.agent_role,
+            )
+        except ValueError:
+            return []
+
+    def _attempt_auto_reassign_inactive_ready_tasks(self, ready_task_ids: list[str]) -> bool:
+        """Reassign soft-constrained ready tasks from inactive roles to active builders."""
+        if not ready_task_ids:
+            return False
+        if not self._is_auto_unblock_coordinator():
+            return False
+        if not self._acquire_auto_unblock_coordinator_slot():
+            return False
+
+        active_roles = self.redis_store.active_roles()
+        if not active_roles:
+            return False
+
+        reassigned = 0
+        for task_id in ready_task_ids:
+            node = self.redis_store.get_task_node(self.goal_id, task_id)
+            if not node:
+                continue
+            current_role = str(node.metadata.get("required_role", "")).strip().lower()
+            if not current_role or current_role in active_roles:
+                continue
+
+            target_roles = self._candidate_fallback_roles(node, active_roles)
+            if not target_roles:
+                continue
+            target_role = target_roles[0]
+
+            if not self.redis_store.acquire_lock(node.id, self.agent_name, self.lease_ttl):
+                continue
+            try:
+                state = self.redis_store.get_task_state(node.id)
+                if not state or state.status is not TaskStatus.READY:
+                    continue
+
+                fresh = self.redis_store.get_task_node(self.goal_id, node.id) or node
+                fresh_role = str(fresh.metadata.get("required_role", "")).strip().lower()
+                if not fresh_role or fresh_role in active_roles:
+                    continue
+                if fresh_role == target_role:
+                    continue
+                if self._role_assignment_is_hard(fresh):
+                    continue
+
+                fresh.metadata.setdefault("original_required_role", fresh_role)
+                fresh.metadata["required_role"] = target_role
+                fresh.metadata["role_assignment"] = "soft"
+                if fresh.metadata.get("phase", "development") == "development" and (
+                    fresh.metadata.get("dev_role") in {None, "", fresh_role}
+                ):
+                    fresh.metadata["dev_role"] = target_role
+
+                prior_count = int(str(fresh.metadata.get("role_reassignments", "0")) or "0")
+                fresh.metadata["role_reassignments"] = str(prior_count + 1)
+                fresh.metadata["last_role_reassignment_reason"] = "inactive-required-role"
+                self.redis_store.update_task_node(self.goal_id, fresh)
+                reassigned += 1
+
+                self.log_event(
+                    logging.WARNING,
+                    "TASK_REASSIGNED_INACTIVE_ROLE",
+                    "[%s] Reassigned task %s from inactive role %s to active role %s",
+                    self.agent_name,
+                    fresh.id,
+                    fresh_role,
+                    target_role,
+                    goal=self.goal_id,
+                    role=self.agent_role,
+                    task=fresh.id,
+                    state="active",
+                )
+            finally:
+                self.redis_store.release_lock(node.id, self.agent_name)
+
+        if reassigned:
+            self.memory.append(
+                f"Policy reassigned {reassigned} ready task(s) from inactive roles on {self.goal_id}"
+            )
+            self.redis_store.store_memory_snapshot(self.agent_name, self.memory.snapshot())
+            self.log_event(
+                logging.INFO,
+                "DEADLOCK_REMEDIATED_INACTIVE_ROLE",
+                "[%s] Remediated inactive-role stall by reassigning %d ready task(s)",
+                self.agent_name,
+                reassigned,
+                goal=self.goal_id,
+                role=self.agent_role,
+                state="active",
+            )
+            return True
+
+        return False
 
     def _is_node_eligible(self, node: TaskNode) -> bool:
         """Return whether this agent may claim and run the node now."""
