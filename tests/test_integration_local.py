@@ -1,4 +1,4 @@
-"""Local-only integration tests for end-to-end schema-v4 execution."""
+"""Local-only integration tests for end-to-end schema execution."""
 
 from __future__ import annotations
 

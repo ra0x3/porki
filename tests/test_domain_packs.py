@@ -1,4 +1,4 @@
-"""Tests for v4 domain pack interfaces and reference behavior."""
+"""Tests for domain pack interfaces and reference behavior."""
 
 from __future__ import annotations
 

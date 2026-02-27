@@ -1,4 +1,4 @@
-"""Tests for v4 intent validation and policy normalization."""
+"""Tests for intent validation and policy normalization."""
 
 from __future__ import annotations
 

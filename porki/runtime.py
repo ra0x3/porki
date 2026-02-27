@@ -1,4 +1,4 @@
-"""Deterministic runtime skeleton for v4 plan execution."""
+"""Deterministic runtime skeleton for plan execution."""
 
 from __future__ import annotations
 

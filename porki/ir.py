@@ -1,4 +1,4 @@
-"""Typed IR v4 models and deterministic diff utilities."""
+"""Typed IR models and deterministic diff utilities."""
 
 from __future__ import annotations
 

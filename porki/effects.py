@@ -1,4 +1,4 @@
-"""Effect governance and idempotency lifecycle for v4 runtime."""
+"""Effect governance and idempotency lifecycle for runtime."""
 
 from __future__ import annotations
 

@@ -77,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Execute schema-v4 instructions or submit a one-shot prompt to the configured LLM",
+        help="Execute schema instructions or submit a one-shot prompt to the configured LLM",
     )
     run_parser.add_argument("--instructions", type=Path, help="Primary instructions file")
     run_parser.add_argument(
@@ -97,12 +97,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--color", action="store_true", help="Enable colored logging output")
     run_parser.add_argument(
         "--run-id",
-        help="Run identifier used by schema-v4 execution pipeline",
+        help="Run identifier used by schema execution pipeline",
     )
     run_parser.add_argument(
         "--checkpoint",
         type=Path,
-        help="Checkpoint output path used by schema-v4 execution pipeline",
+        help="Checkpoint output path used by schema execution pipeline",
     )
     _add_llm_flags(run_parser)
 
@@ -146,7 +146,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     validate_parser = instructions_subparsers.add_parser(
         "validate",
-        help="Validate a strict schema-v4 YAML instruction file",
+        help="Validate a strict schema YAML instruction file",
     )
     validate_parser.add_argument(
         "--path",
@@ -158,7 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     compile_parser = instructions_subparsers.add_parser(
         "compile",
-        help="Compile a schema-v4 source file into typed IR and legalize it",
+        help="Compile a schema source file into typed IR and legalize it",
     )
     compile_parser.add_argument(
         "--path",
@@ -175,7 +175,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     execute_parser = instructions_subparsers.add_parser(
         "execute",
-        help="Compile+legalize+execute a schema-v4 source with deterministic runtime",
+        help="Compile+legalize+execute a schema source with deterministic runtime",
     )
     execute_parser.add_argument(
         "--path",
@@ -283,7 +283,7 @@ def _instruction_filename(name: str) -> str:
 
 
 def _default_instruction_template(name: str) -> str:
-    """Return a starter schema-v4 YAML template."""
+    """Return a starter schema YAML template."""
     display_name = " ".join(name.strip().split()) or "Goal"
     generated_at = datetime.now(UTC).isoformat(timespec="seconds")
     return (
@@ -428,7 +428,7 @@ def _handle_run_command(args: argparse.Namespace, parser: argparse.ArgumentParse
         return 0
 
     parser.error(
-        "`porki run` now requires schema-v4 instructions when not using --prompt; "
+        "`porki run` now requires schema instructions when not using --prompt; "
         "use `porki instructions execute --path ... --run-id ... --checkpoint ...`"
     )
     return 2

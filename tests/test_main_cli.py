@@ -54,7 +54,7 @@ def test_instructions_parser_subcommands_args():
     assert execute_args.instructions_command == "execute"
 
 
-def test_instructions_create_writes_v4_template(tmp_path):
+def test_instructions_create_writes_template(tmp_path):
     target_dir = tmp_path / "instructions"
     parser = orchestrator_main._build_parser()
     args = parser.parse_args(
@@ -198,7 +198,7 @@ def test_instructions_execute_emits_runtime_result(monkeypatch, tmp_path, capsys
     assert payload["run_id"] == "run-42"
 
 
-def test_run_v4_executes_without_role(monkeypatch, tmp_path, capsys):
+def test_run_executes_without_role(monkeypatch, tmp_path, capsys):
     parser = orchestrator_main._build_parser()
     source = tmp_path / "INSTRUCTIONS.yaml"
     source.write_text('instruction_schema_version: "4"\n', encoding="utf-8")
@@ -207,10 +207,10 @@ def test_run_v4_executes_without_role(monkeypatch, tmp_path, capsys):
         @staticmethod
         def model_dump(mode: str = "json"):
             return {
-                "run_id": "run-v4",
+                "run_id": "run-test",
                 "plan_id": "plan.transform",
                 "executed_tasks": ["coding.plan", "coding.implement"],
-                "checkpoint_path": str(tmp_path / "checkpoints" / "run-v4.json"),
+                "checkpoint_path": str(tmp_path / "checkpoints" / "run-test.json"),
             }
 
     monkeypatch.setattr(
@@ -225,9 +225,9 @@ def test_run_v4_executes_without_role(monkeypatch, tmp_path, capsys):
             "--instructions",
             str(source),
             "--run-id",
-            "run-v4",
+            "run-test",
             "--checkpoint",
-            str(tmp_path / "checkpoints" / "run-v4.json"),
+            str(tmp_path / "checkpoints" / "run-test.json"),
         ]
     )
 
@@ -235,10 +235,10 @@ def test_run_v4_executes_without_role(monkeypatch, tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == 0
-    assert payload["run_id"] == "run-v4"
+    assert payload["run_id"] == "run-test"
 
 
-def test_run_non_v4_instructions_error(tmp_path):
+def test_run_non_schema_instructions_error(tmp_path):
     parser = orchestrator_main._build_parser()
     args = parser.parse_args(["run", "--instructions", str(tmp_path / "INSTRUCTIONS.md")])
     (tmp_path / "INSTRUCTIONS.md").write_text("agents: []\n", encoding="utf-8")

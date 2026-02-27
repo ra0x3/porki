@@ -1,4 +1,4 @@
-"""Tests for typed IR v4 models and diff semantics."""
+"""Tests for typed IR models and diff semantics."""
 
 from __future__ import annotations
 

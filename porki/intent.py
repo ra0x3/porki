@@ -1,4 +1,4 @@
-"""Strict v4 intent source validation and policy normalization."""
+"""Strict intent source validation and policy normalization."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ INSTRUCTION_SCHEMA_VERSION = "4"
 
 
 class GoalClass(StrEnum):
-    """Goal classes supported by v4 intent typing."""
+    """Goal classes supported by intent typing."""
 
     TRANSFORM = "Transform"
     DECIDE = "Decide"
@@ -124,7 +124,7 @@ class AssumptionSensitivityItem(BaseModel):
 
 
 class ConfidenceObject(BaseModel):
-    """Structured confidence metadata required by v4."""
+    """Structured confidence metadata required by schema."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -163,7 +163,7 @@ class GoalSpec(BaseModel):
 
 
 class SourceV4(BaseModel):
-    """Canonical strict source schema v4."""
+    """Canonical strict source schema."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -178,7 +178,7 @@ class SourceV4(BaseModel):
 
     @model_validator(mode="after")
     def validate_schema_version(self) -> SourceV4:
-        """Ensure explicit v4 schema version."""
+        """Ensure explicit schema version."""
         if self.instruction_schema_version != INSTRUCTION_SCHEMA_VERSION:
             raise ValueError(f"instruction_schema_version must be {INSTRUCTION_SCHEMA_VERSION}")
         return self
@@ -452,7 +452,7 @@ def normalize_policy(
         approval_requirements=dict(sorted(merged_approval.items())),
         data_handling_rules=dict(sorted(merged_data_rules.items())),
         suppression_list=sorted({item.strip() for item in source.suppression_list if item.strip()}),
-        version_pin=source.version_pin or "policy.v4",
+        version_pin=source.version_pin or "policy.latest",
         explanations=sorted(
             explanations,
             key=lambda item: (item.decision, item.effect_key, item.source),
@@ -659,7 +659,7 @@ def _normalize_diagnostics(items: list[ValidationDiagnostic]) -> list[Validation
 
 
 def validate_payload(payload: dict[str, Any]) -> ValidationReport:
-    """Validate raw v4 payload and return typed report."""
+    """Validate raw payload and return typed report."""
     diagnostics: list[ValidationDiagnostic] = []
     canonical_policy: CanonicalPolicy | None = None
 
@@ -699,7 +699,7 @@ def validate_payload(payload: dict[str, Any]) -> ValidationReport:
 
 
 def validate_file(path: Path) -> ValidationReport:
-    """Validate v4 source file from disk."""
+    """Validate source file from disk."""
     raw_text = path.read_text(encoding="utf-8")
     if "```" in raw_text:
         return ValidationReport(

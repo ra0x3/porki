@@ -1,4 +1,4 @@
-"""Benchmark harness for v4 packs and runtime quality metrics."""
+"""Benchmark harness for packs and runtime quality metrics."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Tests for v4 benchmark harness scoring and baseline aggregation."""
+"""Tests for benchmark harness scoring and baseline aggregation."""
 
 from __future__ import annotations
 

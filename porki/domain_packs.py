@@ -1,4 +1,4 @@
-"""Domain operator pack interfaces and reference v4 implementations."""
+"""Domain operator pack interfaces and reference implementations."""
 
 from __future__ import annotations
 
@@ -189,7 +189,7 @@ class ResearchPack:
 
 
 def default_domain_packs() -> list[DomainPack]:
-    """Return default pack set for v4 runtime."""
+    """Return default pack set for runtime."""
     return [CodingPack(), OutreachPack(), ResearchPack()]
 
 
