@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,7 +26,7 @@ def test_dag_model_validates_edges():
 def test_task_state_transitions():
     """TaskState helpers should produce expected statuses."""
     state = TaskState(status=TaskStatus.READY)
-    running = state.as_running(owner="agent-1", lease_expires=datetime.now(timezone.utc))
+    running = state.as_running(owner="agent-1", lease_expires=datetime.now(UTC))
     assert running.status is TaskStatus.RUNNING
     done = running.as_done(progress="complete", artifacts=["foo.txt"])
     assert done.status is TaskStatus.DONE

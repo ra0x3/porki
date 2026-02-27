@@ -7,7 +7,7 @@ name = "porki"
 version = "0.8.0"
 description = "Agentic orchestration."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "redis>=5.0",
     "fakeredis>=2.22",
@@ -45,7 +45,7 @@ filterwarnings = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.format]
 quote-style = "double"

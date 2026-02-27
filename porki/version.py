@@ -205,3 +205,10 @@ class InstructionStore(BaseLogger):
         else:
             self.logger.warning("No versions found to delete for ID: %s", instruction_id)
         return deleted
+
+
+__all__ = [
+    "BaseLogger",
+    "InstructionVersion",
+    "InstructionStore",
+]

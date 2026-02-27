@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, Field, RootModel, field_validator, model_validator
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     """Enumerates task lifecycle states in the orchestrator DAG."""
 
     READY = "ready"
@@ -173,3 +173,16 @@ class MemorySnapshot:
 
 
 DEFAULT_LEASE_TTL = timedelta(seconds=30)
+
+__all__ = [
+    "TaskStatus",
+    "TaskNode",
+    "TaskEdge",
+    "DagModel",
+    "TaskState",
+    "GoalDescriptor",
+    "AgentDescriptor",
+    "InstructionSet",
+    "MemorySnapshot",
+    "DEFAULT_LEASE_TTL",
+]

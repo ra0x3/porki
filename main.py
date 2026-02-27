@@ -1,34 +1,23 @@
-"""CLI entrypoint for porki orchestrator/agent roles."""
+"""CLI entrypoint for porki."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import shutil
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 
-import redis
+import yaml
 
-try:
-    import fakeredis
-except ImportError:
-    fakeredis = None
-
-from porki.cache import RedisStore
-from porki.instructions import InstructionParser
-from porki.instruction_schemas import (
-    INSTRUCTION_SCHEMA_VERSION,
-    INSTRUCTION_TEMPLATE_VERSION,
-    render_instruction_schema_reference,
-)
+from porki.compiler import compile_source, emit_compile_result, execute_source
+from porki.intent import validate_file
 from porki.llm import LLMRuntimeConfig, create_llm_client
 from porki.logging_utils import CompactingHandler, EventContextFilter, EventFormatter
-from porki.orchestrator import Orchestrator, RealSpawnAdapter
-from porki.runtime import AgentRuntime
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser."""
     version = _get_version()
     parser = argparse.ArgumentParser(
-        prog="porki", description=f"Porki agent/orchestrator entrypoint (version {version})"
+        prog="porki", description=f"Porki typed intent runtime (version {version})"
     )
     parser.add_argument(
         "--version", action="version", version=f"porki {version}", help="Show version and exit"
@@ -88,9 +77,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Run orchestrator/agent loops or submit a one-shot prompt to the configured LLM",
+        help="Execute schema-v4 instructions or submit a one-shot prompt to the configured LLM",
     )
-    run_parser.add_argument("--role", choices=["agent", "orchestrator"], help="Process role")
     run_parser.add_argument("--instructions", type=Path, help="Primary instructions file")
     run_parser.add_argument(
         "-p",
@@ -99,7 +87,6 @@ def _build_parser() -> argparse.ArgumentParser:
         const="",
         help="Simple one-shot prompt sent directly to the configured LLM",
     )
-    run_parser.add_argument("--redis-url", default="fakeredis://", help="Redis connection URL")
     run_parser.add_argument("--log-level", default="INFO", help="Python logging level")
     run_parser.add_argument(
         "--log-style",
@@ -108,34 +95,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Terminal log style: concise (default) or event (full context)",
     )
     run_parser.add_argument("--color", action="store_true", help="Enable colored logging output")
-    run_parser.add_argument("--agent-name", help="Agent identifier when running in agent mode")
-    run_parser.add_argument("--agent-role", help="Agent role identifier when running in agent mode")
-    run_parser.add_argument("--goal-id", help="Goal identifier for the active DAG")
-    run_parser.add_argument("--heartbeat", type=Path, help="Heartbeat file path for agent role")
     run_parser.add_argument(
-        "--loop-interval", type=float, default=1.0, help="Agent loop interval in seconds"
-    )
-    run_parser.add_argument("--lease-ttl", type=float, default=30.0, help="Lease TTL in seconds")
-    run_parser.add_argument(
-        "--poll-interval", type=float, default=5.0, help="Orchestrator poll interval in seconds"
+        "--run-id",
+        help="Run identifier used by schema-v4 execution pipeline",
     )
     run_parser.add_argument(
-        "--heartbeat-interval",
-        type=float,
-        default=300.0,
-        help="Agent heartbeat file read interval in seconds",
-    )
-    run_parser.add_argument(
-        "--instruction-interval",
-        type=float,
-        default=300.0,
-        help="Agent instructions reload interval in seconds",
-    )
-    run_parser.add_argument(
-        "--idle-log-interval",
-        type=float,
-        default=60.0,
-        help="Agent idle-state summary log interval in seconds",
+        "--checkpoint",
+        type=Path,
+        help="Checkpoint output path used by schema-v4 execution pipeline",
     )
     _add_llm_flags(run_parser)
 
@@ -179,7 +146,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     validate_parser = instructions_subparsers.add_parser(
         "validate",
-        help="Validate a strict YAML orchestrator instruction file",
+        help="Validate a strict schema-v4 YAML instruction file",
     )
     validate_parser.add_argument(
         "--path",
@@ -189,16 +156,47 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("--log-level", default="INFO", help="Python logging level")
 
+    compile_parser = instructions_subparsers.add_parser(
+        "compile",
+        help="Compile a schema-v4 source file into typed IR and legalize it",
+    )
+    compile_parser.add_argument(
+        "--path",
+        type=Path,
+        required=True,
+        help="Instruction YAML file to compile",
+    )
+    compile_parser.add_argument(
+        "--out",
+        type=Path,
+        help="Optional JSON output path for compile artifact",
+    )
+    compile_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+
+    execute_parser = instructions_subparsers.add_parser(
+        "execute",
+        help="Compile+legalize+execute a schema-v4 source with deterministic runtime",
+    )
+    execute_parser.add_argument(
+        "--path",
+        type=Path,
+        required=True,
+        help="Instruction YAML file to execute",
+    )
+    execute_parser.add_argument(
+        "--run-id",
+        required=True,
+        help="Stable run identifier used in runtime and checkpoints",
+    )
+    execute_parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Checkpoint JSON output path",
+    )
+    execute_parser.add_argument("--log-level", default="INFO", help="Python logging level")
+
     return parser
-
-
-def _redis_client_from_url(url: str):
-    """Construct Redis client from connection URL."""
-    if url.startswith("fakeredis://"):
-        if not fakeredis:
-            raise RuntimeError("fakeredis is not installed")
-        return fakeredis.FakeRedis(decode_responses=False)
-    return redis.Redis.from_url(url)
 
 
 def _configure_logging(level: str, use_color: bool = False, log_style: str = "concise") -> None:
@@ -263,61 +261,117 @@ def _normalize_prompt(value: str | None) -> str | None:
     return text or None
 
 
+def _read_instruction_schema_version(path: Path) -> str:
+    """Read instruction schema version from a YAML source path."""
+    if not path.exists():
+        return ""
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("instruction_schema_version", "")).strip()
+
+
 def _instruction_filename(name: str) -> str:
     """Convert user-provided instruction name into uppercase snake-case filename."""
     tokens = re.findall(r"[A-Za-z0-9]+", name.upper())
     if not tokens:
         raise ValueError("Instruction name must contain at least one alphanumeric character")
-    return f"{'_'.join(tokens)}.md"
+    return f"{'_'.join(tokens)}.yaml"
 
 
 def _default_instruction_template(name: str) -> str:
-    """Return a starter markdown template for role instructions."""
-    display_name = " ".join(name.strip().split()) or "Role"
-    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    metadata = (
-        "---\n"
-        f'porki_instruction_template_version: "{INSTRUCTION_TEMPLATE_VERSION}"\n'
-        f'porki_schema_version: "{INSTRUCTION_SCHEMA_VERSION}"\n'
-        f'generated_at_utc: "{generated_at}"\n'
-        'generated_by: "porki instructions create"\n'
-        "---\n\n"
+    """Return a starter schema-v4 YAML template."""
+    display_name = " ".join(name.strip().split()) or "Goal"
+    generated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    return (
+        'instruction_schema_version: "4"\n'
+        "goal_typing:\n"
+        "  primary_goal_class: Transform\n"
+        "  secondary_goal_classes: [Decide]\n"
+        "goal:\n"
+        f'  statement: "{display_name}"\n'
+        "  requested_effects:\n"
+        "    - primitive: fs.write\n"
+        "      data_class: internal\n"
+        "      recipient_class: internal\n"
+        "      consent_class: na\n"
+        "      legal_basis_class: na\n"
+        "      reversibility_class: reversible\n"
+        "inputs:\n"
+        "  artifact_path: artifacts/output.txt\n"
+        "policy:\n"
+        "  profile: fast\n"
+        "success:\n"
+        "  rubric: output artifact exists\n"
+        "assumptions:\n"
+        "  - id: a1\n"
+        "    statement: filesystem is writable\n"
+        "    status: confirmed\n"
+        "confidence:\n"
+        f'  target_statement: "Plan can satisfy {display_name}"\n'
+        "  calibration_source: none\n"
+        "  interval:\n"
+        "    low: 0.4\n"
+        "    high: 0.8\n"
+        "  assumption_sensitivity:\n"
+        "    - assumption_id: a1\n"
+        "      rank: 1\n"
+        "      breaks_if_false: true\n"
+        "  evidence_gap: []\n"
+        "  last_updated_at_stage: capture\n"
+        "_meta:\n"
+        f'  generated_at_utc: "{generated_at}"\n'
+        '  generated_by: "porki instructions create"\n'
     )
-    body = f"""# {display_name} Instructions
-
-## Role
-Describe the role clearly. Focus on responsibilities and boundaries.
-
-## Working Directory
-`<project-root-or-subdir>/`
-
-## Prerequisites
-List what must exist before this role starts.
-
-## Responsibilities
-- Primary responsibility 1
-- Primary responsibility 2
-- Primary responsibility 3
-
-## Deliverables
-- Deliverable 1
-- Deliverable 2
-- Deliverable 3
-"""
-    return f"{metadata}{body}\n{render_instruction_schema_reference()}"
 
 
 def _handle_instructions_command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Handle `porki instructions` subcommands."""
     if args.instructions_command == "validate":
-        parser_obj = InstructionParser(args.path.expanduser().resolve())
-        agents = parser_obj.parse_agents()
+        source_path = args.path.expanduser().resolve()
+        if not source_path.exists():
+            report = {
+                "valid": False,
+                "schema_version": None,
+                "diagnostics": [
+                    {
+                        "code": "source.file.missing",
+                        "severity": "error",
+                        "path": "$",
+                        "message": f"Instruction file does not exist: {source_path}",
+                    }
+                ],
+            }
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 1
+
+        report = validate_file(source_path)
         LOGGER.info(
-            "Validated instruction file %s (schema v2, agents=%d)",
-            parser_obj.instructions_path,
-            len(agents),
+            "Validated instruction file %s (schema=%s, valid=%s)",
+            source_path,
+            report.schema_version,
+            report.valid,
         )
-        print(f"valid: {parser_obj.instructions_path} agents={len(agents)}")
+        print(report.as_json())
+        return 0 if report.valid else 1
+
+    if args.instructions_command == "compile":
+        source_path = args.path.expanduser().resolve()
+        result = compile_source(source_path)
+        if args.out:
+            written = emit_compile_result(result, path=args.out.expanduser().resolve())
+            LOGGER.info("Wrote compile artifact to %s", written)
+        print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
+        return 0 if result.valid else 1
+
+    if args.instructions_command == "execute":
+        source_path = args.path.expanduser().resolve()
+        checkpoint_path = args.checkpoint.expanduser().resolve()
+        result = execute_source(source_path, run_id=args.run_id, checkpoint_path=checkpoint_path)
+        print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
         return 0
 
     if args.instructions_command != "create":
@@ -344,66 +398,40 @@ def _handle_run_command(args: argparse.Namespace, parser: argparse.ArgumentParse
     """Handle `porki run` command."""
     prompt = _normalize_prompt(args.prompt)
     if prompt:
-        if args.role or args.instructions:
-            parser.error("Use either --prompt or (--role and --instructions), not both")
+        if args.instructions:
+            parser.error("Use either --prompt or --instructions, not both")
         llm_config = _resolve_llm_config(args)
         llm_client = create_llm_client(llm_config)
         print(llm_client.run_prompt(prompt))
         return 0
 
-    if not args.role:
-        parser.error("`porki run` requires --role when --prompt is not provided")
-    if not args.instructions:
-        parser.error("`porki run` requires --instructions when --prompt is not provided")
+    instruction_schema_version = ""
+    instructions_path = args.instructions.expanduser().resolve() if args.instructions else None
+    if instructions_path is not None:
+        instruction_schema_version = _read_instruction_schema_version(instructions_path)
 
-    client = _redis_client_from_url(args.redis_url)
-    store = RedisStore(client)
-    llm_config = _resolve_llm_config(args)
-
-    if args.role == "agent":
-        if not args.agent_name or not args.goal_id or not args.heartbeat:
-            parser.error("Agent role requires --agent-name, --goal-id, and --heartbeat")
-        llm_client = create_llm_client(llm_config, redis_url=args.redis_url)
-        runtime = AgentRuntime(
-            agent_name=args.agent_name,
-            agent_role=args.agent_role or args.agent_name,
-            goal_id=args.goal_id,
-            instructions_path=args.instructions,
-            heartbeat_path=args.heartbeat,
-            redis_store=store,
-            llm_client=llm_client,
-            loop_interval=args.loop_interval,
-            lease_ttl=timedelta(seconds=args.lease_ttl),
-            heartbeat_refresh_interval=timedelta(seconds=args.heartbeat_interval),
-            instructions_refresh_interval=timedelta(seconds=args.instruction_interval),
-            idle_log_interval=timedelta(seconds=args.idle_log_interval),
-        )
+    if instruction_schema_version == "4":
+        run_id = args.run_id or "run-default"
+        checkpoint = args.checkpoint or Path(".porki") / "checkpoints" / f"{run_id}.json"
+        checkpoint_path = checkpoint.expanduser().resolve()
         try:
-            runtime.run()
-        except KeyboardInterrupt:
-            LOGGER.info("Shutdown requested (Ctrl+C). Stopping gracefully...")
-            runtime.stop()
+            result = execute_source(
+                instructions_path,
+                run_id=run_id,
+                checkpoint_path=checkpoint_path,
+            )
+        except ValueError:
+            compiled = compile_source(instructions_path)
+            print(json.dumps(compiled.model_dump(mode="json"), indent=2, sort_keys=True))
+            return 1
+        print(json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True))
         return 0
 
-    llm_client = create_llm_client(llm_config, redis_url=args.redis_url)
-    orchestrator = Orchestrator(
-        instructions_path=args.instructions,
-        redis_store=store,
-        redis_url=args.redis_url,
-        llm_client=llm_client,
-        spawn_adapter=RealSpawnAdapter(),
-        poll_interval=args.poll_interval,
-        heartbeat_interval=args.heartbeat_interval,
-        instruction_interval=args.instruction_interval,
-        idle_log_interval=args.idle_log_interval,
-        llm_config=llm_config,
+    parser.error(
+        "`porki run` now requires schema-v4 instructions when not using --prompt; "
+        "use `porki instructions execute --path ... --run-id ... --checkpoint ...`"
     )
-    try:
-        orchestrator.run()
-    except KeyboardInterrupt:
-        LOGGER.info("Shutdown requested (Ctrl+C). Stopping gracefully...")
-        orchestrator.stop()
-    return 0
+    return 2
 
 
 def run_cli(argv: list[str] | None = None) -> int:

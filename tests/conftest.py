@@ -52,13 +52,26 @@ def assets_dir() -> Path:
 def pytest_configure(config):  # pragma: no cover - pytest hook
     """Register custom pytest markers."""
     config.addinivalue_line("markers", "live_claude: marks tests that hit the real Claude API")
+    config.addinivalue_line(
+        "markers",
+        "local_integration: marks full local integration tests excluded from CI by default",
+    )
 
 
 def pytest_collection_modifyitems(config, items):  # pragma: no cover - pytest hook
     """Skip live Claude tests unless explicitly enabled."""
     if os.getenv("RUN_LIVE_CLAUDE") == "1":
-        return
-    skip_live = pytest.mark.skip(reason="set RUN_LIVE_CLAUDE=1 to run live Claude tests")
+        skip_live = None
+    else:
+        skip_live = pytest.mark.skip(reason="set RUN_LIVE_CLAUDE=1 to run live Claude tests")
+    if os.getenv("RUN_LOCAL_INTEGRATION") == "1" and os.getenv("GITHUB_ACTIONS") != "true":
+        skip_local = None
+    else:
+        skip_local = pytest.mark.skip(
+            reason="set RUN_LOCAL_INTEGRATION=1 locally to run local integration tests"
+        )
     for item in items:
-        if "live_claude" in item.keywords:
+        if skip_live is not None and "live_claude" in item.keywords:
             item.add_marker(skip_live)
+        if skip_local is not None and "local_integration" in item.keywords:
+            item.add_marker(skip_local)

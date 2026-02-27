@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from pydantic import ValidationError
 
@@ -22,7 +22,7 @@ LocalRedisClient = redis.Redis
 
 def _now_utc() -> datetime:
     """Return the current UTC timestamp."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class RedisStore(BaseLogger):
@@ -531,9 +531,9 @@ class RedisStore(BaseLogger):
         """Persist goal-wide spending-cap backoff deadline."""
         now = _now_utc()
         if until.tzinfo is None:
-            until = until.replace(tzinfo=timezone.utc)
+            until = until.replace(tzinfo=UTC)
         else:
-            until = until.astimezone(timezone.utc)
+            until = until.astimezone(UTC)
         if until <= now:
             self.clear_goal_spending_cap(goal_id)
             return
@@ -557,9 +557,9 @@ class RedisStore(BaseLogger):
             self.clear_goal_spending_cap(goal_id)
             return None
         if until.tzinfo is None:
-            until = until.replace(tzinfo=timezone.utc)
+            until = until.replace(tzinfo=UTC)
         else:
-            until = until.astimezone(timezone.utc)
+            until = until.astimezone(UTC)
         if until <= _now_utc():
             self.clear_goal_spending_cap(goal_id)
             return None
@@ -596,3 +596,8 @@ class RedisStore(BaseLogger):
             return TaskState(**normalized)
         except ValidationError as exc:
             raise ValueError(f"Invalid task state payload: {raw}") from exc
+
+
+__all__ = [
+    "RedisStore",
+]

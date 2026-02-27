@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from porki.models import DagModel, TaskEdge, TaskNode, TaskState, TaskStatus
 
@@ -46,7 +46,7 @@ def test_list_ready_tasks_recovers_stale_running(redis_store):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-crashed",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
+            lease_expires=datetime.now(UTC) - timedelta(seconds=60),
         ),
     )
 
@@ -63,12 +63,12 @@ def test_list_ready_tasks_recovers_stale_running(redis_store):
 def test_goal_spending_cap_roundtrip(redis_store):
     """Goal spending-cap deadline should round-trip while active."""
     goal_id = "goal-cap"
-    until = datetime.now(timezone.utc) + timedelta(seconds=45)
+    until = datetime.now(UTC) + timedelta(seconds=45)
     redis_store.set_goal_spending_cap_until(goal_id, until)
 
     fetched = redis_store.get_goal_spending_cap_until(goal_id)
     assert fetched is not None
-    assert fetched >= datetime.now(timezone.utc)
+    assert fetched >= datetime.now(UTC)
 
 
 def test_recover_stale_skips_active_owner_with_recent_heartbeat(redis_store):
@@ -82,7 +82,7 @@ def test_recover_stale_skips_active_owner_with_recent_heartbeat(redis_store):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-live",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=30),
+            lease_expires=datetime.now(UTC) - timedelta(seconds=30),
         ),
     )
     redis_store.heartbeat_agent("agent-live", ttl=timedelta(seconds=60))
@@ -105,7 +105,7 @@ def test_recover_stale_skips_running_with_execution_guard(redis_store):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-live",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
+            lease_expires=datetime.now(UTC) - timedelta(seconds=60),
         ),
     )
     assert redis_store.acquire_execution_guard("t1", "agent-live:token", timedelta(seconds=120))
@@ -129,7 +129,7 @@ def test_recover_stale_respects_lease_grace_without_heartbeat(redis_store):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-missing-heartbeat",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=1),
+            lease_expires=datetime.now(UTC) - timedelta(seconds=1),
         ),
     )
 
@@ -140,7 +140,7 @@ def test_recover_stale_respects_lease_grace_without_heartbeat(redis_store):
         TaskState(
             status=TaskStatus.RUNNING,
             owner="agent-missing-heartbeat",
-            lease_expires=datetime.now(timezone.utc) - timedelta(seconds=60),
+            lease_expires=datetime.now(UTC) - timedelta(seconds=60),
         ),
     )
     assert redis_store.list_ready_tasks("goal-lease-grace") == ["t1"]

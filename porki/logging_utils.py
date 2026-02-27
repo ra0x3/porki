@@ -92,7 +92,7 @@ class CompactingHandler(logging.Handler):
             self.acquire()
             if record.levelno >= logging.WARNING:
                 self._emit_pending()
-                self.delegate.handle(record)
+                self._safe_delegate_handle(record)
                 return
             if self._pending_record is None:
                 self._pending_record = record
@@ -114,7 +114,10 @@ class CompactingHandler(logging.Handler):
         try:
             self.acquire()
             self._emit_pending()
-            self.delegate.flush()
+            try:
+                self.delegate.flush()
+            except ValueError:
+                pass
         finally:
             self.release()
 
@@ -131,16 +134,26 @@ class CompactingHandler(logging.Handler):
         if self._pending_record is None:
             return
         if self._pending_count <= 1:
-            self.delegate.handle(self._pending_record)
+            self._safe_delegate_handle(self._pending_record)
         else:
             summary_record = self._clone_record_with_message(
                 self._pending_record,
                 f"{self._SUMMARY_PREFIX}{self._pending_count} {self._pending_message}",
             )
-            self.delegate.handle(summary_record)
+            self._safe_delegate_handle(summary_record)
         self._pending_record = None
         self._pending_message = None
         self._pending_count = 0
+
+    def _safe_delegate_handle(self, record: logging.LogRecord) -> None:
+        """Handle delegate stream teardown without surfacing shutdown noise."""
+        stream = getattr(self.delegate, "stream", None)
+        if stream is not None and getattr(stream, "closed", False):
+            return
+        try:
+            self.delegate.handle(record)
+        except ValueError:
+            pass
 
     @staticmethod
     def _clone_record_with_message(record: logging.LogRecord, message: str) -> logging.LogRecord:
@@ -204,3 +217,13 @@ class ColoredConciseEventFormatter(ConciseEventFormatter):
         record.levelname = original_levelname
 
         return formatted
+
+
+__all__ = [
+    "EventContextFilter",
+    "EventFormatter",
+    "ConciseEventFormatter",
+    "CompactingHandler",
+    "ColoredEventFormatter",
+    "ColoredConciseEventFormatter",
+]

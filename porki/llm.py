@@ -978,3 +978,17 @@ def create_llm_client(
             concurrency_wait_seconds=concurrency_wait_seconds,
         )
     raise ValueError(f"Unsupported LLM provider: {config.provider}")
+
+
+__all__ = [
+    "TaskSelection",
+    "TaskExecutionResult",
+    "RecoveryDecision",
+    "Prompt",
+    "LLMRuntimeConfig",
+    "LLMClient",
+    "ClaudeCLIClient",
+    "StubLLMClient",
+    "CodexCLIClient",
+    "create_llm_client",
+]

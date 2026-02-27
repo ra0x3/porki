@@ -38,3 +38,8 @@ class Memory:
     def __len__(self) -> int:
         """Return number of memory entries."""
         return len(self._entries)
+
+
+__all__ = [
+    "Memory",
+]
